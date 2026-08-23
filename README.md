@@ -24,7 +24,7 @@ does not return oversized content inline:
 The threshold is `OXYLABS_MAX_INLINE_CHARS` (default 40 000). `read_scraped` can only read
 files in the spill directory — it is deliberately not a general file reader.
 
-Full API documentation: **[Oxylabs Web API docs](https://github.com/nedasvi/project-search-docs)**
+Full API documentation: **[Oxylabs Web API docs](https://github.com/oxylabs/gitbook-web-api)**
 
 ## Requirements
 
@@ -35,8 +35,8 @@ Full API documentation: **[Oxylabs Web API docs](https://github.com/nedasvi/proj
 ## Install
 
 ```bash
-git clone https://github.com/nedasvi/project-search-mcp.git
-cd project-search-mcp
+git clone https://github.com/oxylabs/web-api-mcp.git
+cd web-api-mcp
 pip install .
 ```
 
