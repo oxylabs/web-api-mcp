@@ -43,9 +43,18 @@ TIMEOUT = float(os.environ.get("OXYLABS_TIMEOUT", "120"))
 JS_TIMEOUT = float(os.environ.get("OXYLABS_JS_TIMEOUT", "300"))
 JOB_TTL_SECONDS = float(os.environ.get("OXYLABS_JOB_TTL_MINUTES", "60")) * 60
 
-# Content larger than this is offloaded to disk (local) or truncated (remote).
-MAX_INLINE_CHARS = int(os.environ.get("OXYLABS_MAX_INLINE_CHARS", "40000"))
+# Content bigger than this is offloaded to disk (local) or truncated (remote). Measured in
+# tokens, not characters: 40k characters of English is ~10k tokens, but 40k characters of
+# Chinese is ~40k tokens, and the major clients reject a tool result over 25k.
+MAX_INLINE_TOKENS = int(os.environ.get("OXYLABS_MAX_INLINE_TOKENS", "10000"))
+READ_CHUNK_CHARS = int(os.environ.get("OXYLABS_READ_CHUNK_CHARS", "40000"))
 PREVIEW_CHARS = 2000
+
+# Transient upstream failures are retried here rather than handed to the agent, which has
+# no better recovery than trying again.
+RETRY_STATUS = frozenset({500, 502, 503, 504})
+RETRIES = int(os.environ.get("OXYLABS_RETRIES", "2"))
+RETRY_BASE_DELAY = float(os.environ.get("OXYLABS_RETRY_BASE_DELAY", "1"))
 
 # Below this much visible text, a page fetched without JavaScript is probably a shell.
 THIN_CONTENT_CHARS = int(os.environ.get("OXYLABS_THIN_CONTENT_CHARS", "500"))
@@ -72,10 +81,16 @@ try:
 except PackageNotFoundError:  # running from a checkout that was never installed
     VERSION = "0.0.0+local"
 
+
 # Every tool here only reads: nothing it calls creates, changes or deletes anything the
 # caller owns. Clients use readOnlyHint to decide what can run without a prompt.
-NETWORK_READ = ToolAnnotations(readOnlyHint=True, openWorldHint=True)
-LOCAL_READ = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
+def _network_read(title: str) -> ToolAnnotations:
+    return ToolAnnotations(title=title, readOnlyHint=True, openWorldHint=True)
+
+
+def _local_read(title: str) -> ToolAnnotations:
+    return ToolAnnotations(title=title, readOnlyHint=True, openWorldHint=False)
+
 
 mcp = MCPServer(
     name="oxylabs-web-api",
@@ -154,15 +169,83 @@ def _api_key(ctx: Context | None = None) -> str:
     return key
 
 
+def _sanitize_client_field(value: object, max_length: int = 64) -> str | None:
+    """Make a client-supplied string safe to put in an outbound header.
+
+    The client names itself during `initialize` and we forward that for attribution, so it
+    is untrusted input on its way into a header value: control characters (CR and LF above
+    all) would let a malformed name split or inject headers, and an unbounded name would
+    push the request past an upstream header limit.
+    """
+    if not isinstance(value, str):
+        return None
+    cleaned = "".join(char if char.isprintable() else " " for char in value).strip()
+    return cleaned[:max_length] or None
+
+
 def _sdk_header(ctx: Context | None) -> str:
     """Identify this server, and the client driving it, to the API."""
     client = "oxylabs-web-api-mcp"
     try:
-        name = ctx.request_context.session.client_params.clientInfo.name  # type: ignore[union-attr]
-        client = f"{client}-{name}"
+        name = _sanitize_client_field(
+            ctx.request_context.session.client_params.clientInfo.name  # type: ignore[union-attr]
+        )
+        if name:
+            client = f"{client}-{name}"
     except Exception:  # noqa: BLE001 — telemetry must never be the reason a call fails
         pass
     return f"{client}/{VERSION} (python {python_version()})"
+
+
+# ------------------------------------------------------------------------- token budget
+
+
+def _estimate_tokens(text: str) -> int:
+    """Approximate the tokens `text` will cost the client.
+
+    ~4 characters per token holds for Latin scripts and is wildly wrong for CJK, where a
+    character is close to a whole token. Splitting by script beats a flat ratio, and this
+    only has to be good enough to decide whether a page is handed over whole.
+    """
+    cjk = sum(
+        1
+        for char in text
+        if "぀" <= char <= "ヿ"
+        or "㐀" <= char <= "䶿"
+        or "一" <= char <= "鿿"
+        or "豈" <= char <= "﫿"
+        or "가" <= char <= "힯"
+    )
+    return cjk + (len(text) - cjk + 3) // 4
+
+
+def _token_budget(ctx: Context | None) -> int | None:
+    """How many tokens of content this caller can take. None means no limit.
+
+    Defaults to `OXYLABS_MAX_INLINE_TOKENS`, which sits under the 25k-token cap the major
+    clients put on a single tool result. A client that knows its own limit can say so with
+    an `X-MCP-Max-Tokens` header or a `?max_tokens=` query parameter; `0` opts out.
+    """
+    declared = None
+    if ctx is not None:
+        declared = (ctx.headers or {}).get("x-mcp-max-tokens")
+        if declared is None:
+            try:
+                declared = ctx.request_context.request.query_params.get("max_tokens")  # type: ignore[union-attr]
+            except Exception:  # noqa: BLE001 — no request, or a transport without query params
+                declared = None
+
+    if declared is not None:
+        try:
+            asked = int(str(declared).strip())
+        except ValueError:
+            asked = -1
+        if asked == 0:
+            return None  # explicit opt-out
+        if asked > 0:
+            return asked
+
+    return MAX_INLINE_TOKENS
 
 
 def _detail(resp: httpx.Response) -> str:
@@ -196,6 +279,43 @@ def _check(resp: httpx.Response, path: str) -> dict[str, Any]:
         return {"raw": resp.text[:20000]}
 
 
+def _parse_rate_limit(spec: str) -> tuple[int, float] | None:
+    """Parse `OXYLABS_RATE_LIMIT`, e.g. "100/1h" — a count and a window in seconds."""
+    spec = spec.strip()
+    if not spec:
+        return None
+    match = re.fullmatch(r"(\d+)/(\d+)([smh])", spec)
+    if not match:
+        raise ValueError(f"OXYLABS_RATE_LIMIT must look like '100/1h' or '50/30m', got {spec!r}")
+    count, size, unit = int(match[1]), int(match[2]), match[3]
+    return count, size * {"s": 1, "m": 60, "h": 3600}[unit]
+
+
+RATE_LIMIT = _parse_rate_limit(os.environ.get("OXYLABS_RATE_LIMIT", ""))
+_CALL_TIMES: list[float] = []
+
+
+def _check_rate_limit() -> None:
+    """Stop a runaway agent from spending the whole key. Off unless the operator sets it.
+
+    ponytail: a list of timestamps in one process — a shared counter the day this runs
+    behind more than one replica.
+    """
+    if RATE_LIMIT is None:
+        return
+    count, window = RATE_LIMIT
+    cutoff = time.time() - window
+    _CALL_TIMES[:] = [t for t in _CALL_TIMES if t > cutoff]
+    if len(_CALL_TIMES) >= count:
+        wait = int(_CALL_TIMES[0] + window - time.time()) + 1
+        raise ApiError(
+            f"This server's own rate limit ({os.environ.get('OXYLABS_RATE_LIMIT')}) is "
+            f"exhausted. It frees up in about {wait}s. Do not retry in a loop — do "
+            "something else, or ask the operator to raise OXYLABS_RATE_LIMIT."
+        )
+    _CALL_TIMES.append(time.time())
+
+
 async def _request(
     method: str,
     path: str,
@@ -205,7 +325,13 @@ async def _request(
     api_key: str | None = None,
     timeout: float | None = None,
 ) -> dict[str, Any]:
-    """Call the Web API, turning transport failures into agent-readable errors."""
+    """Call the Web API, turning transport failures into agent-readable errors.
+
+    Transient upstream failures (500, 502, 503, 504) and connection errors are retried
+    here with exponential backoff. The agent has no better move than trying again, so
+    doing it in the server saves a round trip and a confused recovery.
+    """
+    _check_rate_limit()
     headers = {
         "Authorization": f"Bearer {api_key or _api_key(ctx)}",
         "x-oxylabs-sdk": _sdk_header(ctx),
@@ -213,16 +339,33 @@ async def _request(
     if payload is not None:
         headers["Content-Type"] = "application/json"
     seconds = TIMEOUT if timeout is None else timeout
-    try:
-        async with httpx.AsyncClient(timeout=seconds) as client:
-            resp = await client.request(method, f"{BASE_URL}{path}", json=payload, headers=headers)
-    except httpx.TimeoutException as exc:
-        raise ApiError(
-            f"Request to {path} timed out after {seconds:.0f}s. Retry, or narrow the request."
-        ) from exc
-    except httpx.HTTPError as exc:
-        raise ApiError(f"Could not reach the Oxylabs Web API at {BASE_URL}{path}: {exc}") from exc
-    return _check(resp, path)
+
+    last_error: ApiError | None = None
+    for attempt in range(RETRIES + 1):
+        if attempt:
+            await asyncio.sleep(RETRY_BASE_DELAY * 2 ** (attempt - 1))
+            await _note(ctx, f"Retrying {path} (attempt {attempt + 1} of {RETRIES + 1})")
+        try:
+            async with httpx.AsyncClient(timeout=seconds) as client:
+                resp = await client.request(
+                    method, f"{BASE_URL}{path}", json=payload, headers=headers
+                )
+        except httpx.TimeoutException as exc:
+            # A timeout is not retried: the work was probably done and billed, and a
+            # second copy of a slow request makes the queue worse.
+            raise ApiError(
+                f"Request to {path} timed out after {seconds:.0f}s. Retry, or narrow the request."
+            ) from exc
+        except httpx.HTTPError as exc:
+            last_error = ApiError(f"Could not reach the Oxylabs Web API at {BASE_URL}{path}: {exc}")
+            continue
+
+        if resp.status_code in RETRY_STATUS and attempt < RETRIES:
+            last_error = ApiError(f"{path} returned {resp.status_code}: {_detail(resp)}")
+            continue
+        return _check(resp, path)
+
+    raise last_error or ApiError(f"{path} failed after {RETRIES + 1} attempts.")
 
 
 async def _note(ctx: Context | None, message: str) -> None:
@@ -267,8 +410,9 @@ def _spill(text: str, url: str, fmt: str) -> Path:
     return path
 
 
-def _offload(result: dict[str, Any], text: str, url: str, fmt: str) -> None:
+def _offload(result: dict[str, Any], text: str, url: str, fmt: str, budget: int) -> None:
     """Replace oversized `content` in place with a pointer or a truncation notice."""
+    tokens = _estimate_tokens(text)
     if _SPILL_ENABLED:
         path = _spill(text, url, fmt)
         result["content"] = text[:PREVIEW_CHARS]
@@ -276,6 +420,7 @@ def _offload(result: dict[str, Any], text: str, url: str, fmt: str) -> None:
             "path": str(path),
             "format": fmt,
             "total_chars": len(text),
+            "estimated_tokens": tokens,
             "preview_chars": min(PREVIEW_CHARS, len(text)),
             "note": (
                 "`content` above is only the first "
@@ -286,23 +431,33 @@ def _offload(result: dict[str, Any], text: str, url: str, fmt: str) -> None:
             ),
         }
     else:
-        result["content"] = text[:MAX_INLINE_CHARS]
+        # Token density is roughly uniform within a page, so a proportional cut lands
+        # close enough to the budget without counting the whole thing twice.
+        keep = max(1, int(len(text) * budget / tokens))
+        result["content"] = text[:keep]
         result["content_truncated"] = {
             "total_chars": len(text),
-            "returned_chars": MAX_INLINE_CHARS,
+            "returned_chars": min(keep, len(text)),
+            "estimated_tokens": tokens,
+            "token_budget": budget,
             "note": (
-                "Content exceeded the inline limit and was truncated. This server runs over "
-                "HTTP, so it cannot hand back a file path the caller could open. Run the "
-                "server over stdio to get full pages offloaded to disk instead."
+                f"The page is about {tokens} tokens, over the {budget}-token budget for one "
+                "tool result, and this server runs over HTTP so it cannot hand back a file "
+                "path to read in chunks. To see the rest: scrape a more specific URL, ask "
+                "for the section you need with `extract`, raise the budget with an "
+                "`X-MCP-Max-Tokens` header if your client can take more, or run the server "
+                "over stdio, where full pages go to disk and `read_scraped` walks them."
             ),
         }
 
 
-def _process_content(payload: dict[str, Any], fmt: str) -> dict[str, Any]:
-    """Offload or truncate oversized page content. No reformatting happens here —
-    the API renders the requested format server-side."""
+def _process_content(payload: dict[str, Any], fmt: str, budget: int | None) -> dict[str, Any]:
+    """Offload or truncate page content that would not fit the caller's token budget.
+
+    No reformatting happens here — the API renders the requested format server-side.
+    """
     results = payload.get("results")
-    if not isinstance(results, list):
+    if not isinstance(results, list) or budget is None:
         return payload
 
     requested_url = str(payload.get("params", {}).get("url", ""))
@@ -310,8 +465,14 @@ def _process_content(payload: dict[str, Any], fmt: str) -> dict[str, Any]:
         if not isinstance(result, dict):
             continue
         content = result.get("content")
-        if isinstance(content, str) and len(content) > MAX_INLINE_CHARS:
-            _offload(result, content, str(result.get("url") or requested_url), fmt)
+        if not isinstance(content, str):
+            continue
+        # A token is never fewer than one byte, so anything this short cannot overflow;
+        # skip the scan for the ordinary page.
+        if len(content) <= budget:
+            continue
+        if _estimate_tokens(content) > budget:
+            _offload(result, content, str(result.get("url") or requested_url), fmt, budget)
     return payload
 
 
@@ -400,11 +561,13 @@ def _prune_jobs() -> None:
         _JOBS.pop(job_id, None)
 
 
-async def _run_job(job_id: str, path: str, payload: dict[str, Any], fmt: str, key: str) -> None:
+async def _run_job(
+    job_id: str, path: str, payload: dict[str, Any], fmt: str, key: str, budget: int | None
+) -> None:
     record = _JOBS[job_id]
     try:
         response = await _request("POST", path, payload, api_key=key, timeout=JS_TIMEOUT)
-        record["result"] = _trim(_process_content(response, fmt))
+        record["result"] = _trim(_process_content(response, fmt, budget))
         record["status"] = "done"
     except ApiError as exc:
         record["status"] = "error"
@@ -415,7 +578,9 @@ async def _run_job(job_id: str, path: str, payload: dict[str, Any], fmt: str, ke
     record["finished"] = time.time()
 
 
-def _submit_job(path: str, payload: dict[str, Any], fmt: str, key: str) -> dict[str, Any]:
+def _submit_job(
+    path: str, payload: dict[str, Any], fmt: str, key: str, budget: int | None
+) -> dict[str, Any]:
     """Start a slow render in the background and hand the agent something to poll."""
     _prune_jobs()
     job_id = uuid.uuid4().hex[:12]
@@ -427,7 +592,7 @@ def _submit_job(path: str, payload: dict[str, Any], fmt: str, key: str) -> dict[
         "error": None,
     }
     # Keep the reference: a bare create_task can be garbage-collected mid-flight.
-    _JOBS[job_id]["task"] = asyncio.create_task(_run_job(job_id, path, payload, fmt, key))
+    _JOBS[job_id]["task"] = asyncio.create_task(_run_job(job_id, path, payload, fmt, key, budget))
     return {
         "job_id": job_id,
         "status": "running",
@@ -444,7 +609,7 @@ def _submit_job(path: str, payload: dict[str, Any], fmt: str, key: str) -> dict[
 # ------------------------------------------------------------------------------- tools
 
 
-@mcp.tool(annotations=NETWORK_READ)
+@mcp.tool(annotations=_network_read("Web search"))
 async def search(
     query: Annotated[
         str,
@@ -490,7 +655,7 @@ async def search(
     return _trim(await _request("POST", "/v1/search", payload, ctx=ctx))
 
 
-@mcp.tool(annotations=NETWORK_READ)
+@mcp.tool(annotations=_network_read("Read a page"))
 async def scrape(
     url: URL_PARAM,
     format: Annotated[
@@ -543,10 +708,11 @@ async def scrape(
     if run_js:
         payload["run_js"] = True
         await _note(ctx, f"Rendering {url} with JavaScript in the background")
-        return _submit_job("/v1/scrape", payload, format, _api_key(ctx))
+        return _submit_job("/v1/scrape", payload, format, _api_key(ctx), _token_budget(ctx))
 
     await _note(ctx, f"Scraping {url} as {format}")
-    response = _process_content(await _request("POST", "/v1/scrape", payload, ctx=ctx), format)
+    response = await _request("POST", "/v1/scrape", payload, ctx=ctx)
+    response = _process_content(response, format, _token_budget(ctx))
     return _trim(_flag_thin_content(response))
 
 
@@ -558,7 +724,7 @@ class _ExtractApproval(BaseModel):
     )
 
 
-@mcp.tool(annotations=NETWORK_READ)
+@mcp.tool(annotations=_network_read("Extract fields as JSON"))
 async def extract(
     url: URL_PARAM,
     prompt: Annotated[
@@ -596,10 +762,11 @@ async def extract(
     if run_js:
         payload["run_js"] = True
         await _note(ctx, f"Extracting from {url} with JavaScript in the background")
-        return _submit_job("/v1/scrape", payload, "json", _api_key(ctx))
+        return _submit_job("/v1/scrape", payload, "json", _api_key(ctx), _token_budget(ctx))
 
     await _note(ctx, f"Extracting from {url}")
-    return _trim(_process_content(await _request("POST", "/v1/scrape", payload, ctx=ctx), "json"))
+    response = await _request("POST", "/v1/scrape", payload, ctx=ctx)
+    return _trim(_process_content(response, "json", _token_budget(ctx)))
 
 
 async def _confirm_extract(url: str, prompt: str, ctx: Context | None) -> None:
@@ -627,7 +794,7 @@ async def _confirm_extract(url: str, prompt: str, ctx: Context | None) -> None:
         )
 
 
-@mcp.tool(annotations=LOCAL_READ)
+@mcp.tool(annotations=_local_read("Check a render job"))
 async def check_scrape(
     job_id: Annotated[str, Field(description="The `job_id` returned by a `run_js` call.")],
 ) -> dict[str, Any]:
@@ -663,14 +830,31 @@ async def check_scrape(
     }
 
 
-@mcp.tool(annotations=LOCAL_READ)
+class ScrapedChunk(BaseModel):
+    """A slice of an offloaded page.
+
+    Declared as a model so the tool ships a real output schema: this shape is entirely
+    ours and stable. The tools that pass an API response through keep the permissive
+    schema the SDK derives — pinning those would freeze a contract that is still moving.
+    """
+
+    path: str = Field(description="The file this chunk came from.")
+    offset: int = Field(description="Character offset this chunk starts at.")
+    returned_chars: int = Field(description="How many characters are in `text`.")
+    total_chars: int = Field(description="Size of the whole page, in characters.")
+    next_offset: int = Field(description="Pass this as `offset` to get the next chunk.")
+    eof: bool = Field(description="True when `text` reaches the end of the page.")
+    text: str = Field(description="The chunk itself.")
+
+
+@mcp.tool(annotations=_local_read("Read an offloaded page"))
 async def read_scraped(
     path: Annotated[str, Field(description="Path from a result's `content_offloaded.path`.")],
     offset: Annotated[int, Field(description="Character offset to start at.", ge=0)] = 0,
     length: Annotated[
         int, Field(description="How many characters to return.", ge=1)
-    ] = MAX_INLINE_CHARS,
-) -> dict[str, Any]:
+    ] = READ_CHUNK_CHARS,
+) -> ScrapedChunk:
     """Read a chunk of a scraped page that was offloaded to disk.
 
     Use the `path` from a scrape result's `content_offloaded`. Start at offset 0 and keep
@@ -696,18 +880,18 @@ async def read_scraped(
     text = target.read_text(encoding="utf-8", errors="replace")
     chunk = text[offset : offset + length]
     next_offset = offset + len(chunk)
-    return {
-        "path": str(target),
-        "offset": offset,
-        "returned_chars": len(chunk),
-        "total_chars": len(text),
-        "next_offset": next_offset,
-        "eof": next_offset >= len(text),
-        "text": chunk,
-    }
+    return ScrapedChunk(
+        path=str(target),
+        offset=offset,
+        returned_chars=len(chunk),
+        total_chars=len(text),
+        next_offset=next_offset,
+        eof=next_offset >= len(text),
+        text=chunk,
+    )
 
 
-@mcp.tool(annotations=NETWORK_READ)
+@mcp.tool(annotations=_network_read("List scrape endpoints"))
 async def list_scrapers(
     endpoint: Annotated[
         str | None,
@@ -736,7 +920,7 @@ async def list_scrapers(
     return await _request("OPTIONS", f"/v1/{name}", ctx=ctx)
 
 
-@mcp.tool(annotations=NETWORK_READ)
+@mcp.tool(annotations=_network_read("Call a target scraper"))
 async def scrape_target(
     endpoint: Annotated[
         str,
@@ -771,10 +955,11 @@ async def scrape_target(
 
     if params.get("run_js"):
         await _note(ctx, f"Running /v1/{name} with JavaScript in the background")
-        return _submit_job(f"/v1/{name}", params, fmt, _api_key(ctx))
+        return _submit_job(f"/v1/{name}", params, fmt, _api_key(ctx), _token_budget(ctx))
 
     await _note(ctx, f"Running /v1/{name}")
-    response = _process_content(await _request("POST", f"/v1/{name}", params, ctx=ctx), fmt)
+    response = await _request("POST", f"/v1/{name}", params, ctx=ctx)
+    response = _process_content(response, fmt, _token_budget(ctx))
     return _trim(_flag_thin_content(response))
 
 
@@ -789,6 +974,73 @@ def _endpoint_name(endpoint: str) -> str:
             "`list_scrapers()`, e.g. 'scrape'."
         )
     return name
+
+
+# ------------------------------------------------------------------------------ skill
+
+# The agent skill ships inside this package, so connecting the server is the whole
+# install: a client that never adds the web-api-skills repo still gets the judgment for
+# using these tools well. `scripts/sync-skill.sh` refreshes it from its canonical home.
+SKILL_PATH = Path(__file__).parent / "skills" / "oxylabs-web-api.md"
+_skill_cache: str | None = None
+
+
+def _skill_text() -> str:
+    """The bundled skill, without its frontmatter — that is for a skill loader, not here."""
+    global _skill_cache
+    if _skill_cache is None:
+        text = SKILL_PATH.read_text(encoding="utf-8")
+        if text.startswith("---"):
+            end = text.find("---", 3)
+            if end != -1:
+                text = text[end + 3 :].lstrip()
+        _skill_cache = text
+    return _skill_cache
+
+
+@mcp.resource(
+    "oxylabs://skill/web-api",
+    name="oxylabs_web_api_skill",
+    title="Using the Oxylabs Web API well",
+    description=(
+        "How to use these tools: search to find and scrape to read, when JavaScript "
+        "rendering is worth its cost, what to do with an empty page, and the citation "
+        "rules that keep an answer honest. Read it before a research task."
+    ),
+    mime_type="text/markdown",
+)
+def skill_resource() -> str:
+    return _skill_text()
+
+
+@mcp.resource(
+    "oxylabs://tools/list",
+    name="oxylabs_tools_list",
+    title="Tool inventory",
+    description="This server's tools and what each is for.",
+    mime_type="text/markdown",
+)
+async def tools_resource() -> str:
+    lines = ["# Tools on this server", ""]
+    for tool in await mcp.list_tools():
+        summary = (tool.description or "").strip().splitlines()
+        lines.append(f"- **{tool.name}** — {summary[0] if summary else ''}")
+    return "\n".join(lines)
+
+
+@mcp.prompt(
+    name="web_research",
+    title="Research a question from live sources",
+    description="Load the Web API skill and start a cited research loop on a question.",
+)
+def web_research_prompt(question: str = "") -> str:
+    """Hand the agent the skill plus the task, so the method arrives with the request."""
+    task = (
+        f"Research this question and answer it with citations:\n\n{question}"
+        if question.strip()
+        else "Ask me what to research, then follow the method below."
+    )
+    return f"{task}\n\n---\n\n{_skill_text()}"
 
 
 # ---------------------------------------------------------------------------- transport

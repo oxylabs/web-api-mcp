@@ -82,8 +82,8 @@ def test_oversized_content_spills_to_disk_when_local(tmp_dir=None):
     os.environ["OXYLABS_SPILL_DIR"] = spill
     srv._SPILL_ENABLED = True
     try:
-        size = srv.MAX_INLINE_CHARS + 5000
-        out = srv._process_content(_big_payload(size), "markdown")
+        size = srv.MAX_INLINE_TOKENS * 4 + 5000
+        out = srv._process_content(_big_payload(size), "markdown", srv.MAX_INLINE_TOKENS)
         result = out["results"][0]
         info = result["content_offloaded"]
 
@@ -94,9 +94,9 @@ def test_oversized_content_spills_to_disk_when_local(tmp_dir=None):
 
         # The agent walks the file in chunks and reaches the end.
         first = asyncio.run(read_scraped(info["path"], offset=0, length=1000))
-        assert first["returned_chars"] == 1000 and not first["eof"], first
+        assert first.returned_chars == 1000 and not first.eof, first
         last = asyncio.run(read_scraped(info["path"], offset=size - 10, length=1000))
-        assert last["eof"] and last["returned_chars"] == 10, last
+        assert last.eof and last.returned_chars == 10, last
     finally:
         srv._SPILL_ENABLED = False
         del os.environ["OXYLABS_SPILL_DIR"]
@@ -104,15 +104,17 @@ def test_oversized_content_spills_to_disk_when_local(tmp_dir=None):
 
 def test_oversized_content_truncates_when_remote():
     srv._SPILL_ENABLED = False
-    size = srv.MAX_INLINE_CHARS + 5000
-    result = srv._process_content(_big_payload(size), "markdown")["results"][0]
+    size = srv.MAX_INLINE_TOKENS * 4 + 5000
+    result = srv._process_content(_big_payload(size), "markdown", srv.MAX_INLINE_TOKENS)["results"][
+        0
+    ]
     assert result["content_truncated"]["total_chars"] == size
-    assert len(result["content"]) == srv.MAX_INLINE_CHARS
+    assert result["content_truncated"]["returned_chars"] < size
     assert "content_offloaded" not in result
 
 
 def test_small_content_is_left_alone():
-    out = srv._process_content(_big_payload(100), "markdown")["results"][0]
+    out = srv._process_content(_big_payload(100), "markdown", srv.MAX_INLINE_TOKENS)["results"][0]
     assert out["content"] == "x" * 100
     assert "content_offloaded" not in out and "content_truncated" not in out
 
@@ -372,10 +374,187 @@ def test_a_long_article_about_javascript_is_not_a_shell():
 
 
 def test_offloaded_pages_are_never_called_thin():
-    payload = _page("x" * (srv.MAX_INLINE_CHARS + 100))
+    payload = _page("x" * (srv.MAX_INLINE_TOKENS * 4 + 100))
     srv._SPILL_ENABLED = False
-    out = srv._flag_thin_content(srv._process_content(payload, "markdown"))["results"][0]
+    out = srv._flag_thin_content(srv._process_content(payload, "markdown", srv.MAX_INLINE_TOKENS))[
+        "results"
+    ][0]
     assert "content_truncated" in out and "content_thin" not in out, out
+
+
+# ------------------------------------------------------- hardening from the competitor survey
+
+
+def test_client_name_cannot_inject_a_header():
+    assert srv._sanitize_client_field("evil\r\nX-Injected: 1") == "evil  X-Injected: 1"
+    assert len(srv._sanitize_client_field("x" * 5000)) == 64
+    assert srv._sanitize_client_field("  \t  ") is None
+    assert srv._sanitize_client_field(None) is None
+
+    # And the header it builds is single-line whatever the client called itself.
+    class _Bad:
+        class request_context:
+            class session:
+                class client_params:
+                    class clientInfo:
+                        name = "a\r\nb"
+
+    header = srv._sdk_header(_Bad())
+    assert "\r" not in header and "\n" not in header, header
+
+
+def test_token_estimate_is_script_aware():
+    latin = "word " * 200  # 1000 chars of English
+    cjk = "\u4e2d" * 1000  # 1000 Chinese characters
+    assert srv._estimate_tokens(latin) < 300, srv._estimate_tokens(latin)
+    assert srv._estimate_tokens(cjk) == 1000, srv._estimate_tokens(cjk)
+    # The old char-based rule treated these as equal; they are 4x apart.
+    assert srv._estimate_tokens(cjk) > srv._estimate_tokens(latin) * 3
+
+
+def test_a_cjk_page_that_fits_in_chars_is_still_offloaded():
+    srv._SPILL_ENABLED = False
+    page = {"results": [{"content": "\u4e2d" * 20000, "url": "https://ex.com"}], "params": {}}
+    out = srv._process_content(page, "markdown", srv.MAX_INLINE_TOKENS)["results"][0]
+    assert "content_truncated" in out, "20k CJK chars is ~20k tokens and must not go inline"
+    assert out["content_truncated"]["estimated_tokens"] == 20000
+
+
+def test_client_can_declare_its_own_token_budget():
+    assert srv._token_budget(None) == srv.MAX_INLINE_TOKENS
+    assert srv._token_budget(_FakeCtx(headers={"x-mcp-max-tokens": "50000"})) == 50000
+    assert srv._token_budget(_FakeCtx(headers={"x-mcp-max-tokens": "0"})) is None
+    assert (
+        srv._token_budget(_FakeCtx(headers={"x-mcp-max-tokens": "nonsense"}))
+        == srv.MAX_INLINE_TOKENS
+    )
+
+
+def test_truncation_notice_says_how_to_get_the_rest():
+    srv._SPILL_ENABLED = False
+    page = {"results": [{"content": "word " * 40000, "url": "https://ex.com"}], "params": {}}
+    note = srv._process_content(page, "markdown", 1000)["results"][0]["content_truncated"]["note"]
+    for hint in ("X-MCP-Max-Tokens", "stdio", "extract"):
+        assert hint in note, note
+
+
+def test_transient_failures_are_retried_then_succeed():
+    calls = []
+
+    class _Client:
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def request(self, method, url, json=None, headers=None):
+            calls.append(url)
+            status = 503 if len(calls) < 3 else 200
+            return httpx.Response(
+                status,
+                json={"results": []} if status == 200 else {"message": "upstream"},
+                request=httpx.Request(method, url),
+            )
+
+    real_client, real_delay = httpx.AsyncClient, srv.RETRY_BASE_DELAY
+    httpx.AsyncClient, srv.RETRY_BASE_DELAY = _Client, 0
+    try:
+        out = asyncio.run(srv._request("POST", "/v1/search", {"query": "x"}))
+        assert out == {"results": []}
+        assert len(calls) == 3, calls
+    finally:
+        httpx.AsyncClient, srv.RETRY_BASE_DELAY = real_client, real_delay
+
+
+def test_retries_give_up_and_report_the_last_failure():
+    class _Client:
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def request(self, method, url, json=None, headers=None):
+            return httpx.Response(
+                502, json={"message": "still down"}, request=httpx.Request(method, url)
+            )
+
+    real_client, real_delay = httpx.AsyncClient, srv.RETRY_BASE_DELAY
+    httpx.AsyncClient, srv.RETRY_BASE_DELAY = _Client, 0
+    try:
+        asyncio.run(srv._request("POST", "/v1/search", {"query": "x"}))
+    except ApiError as exc:
+        assert "502" in str(exc), exc
+    else:
+        raise AssertionError("expected ApiError after exhausting retries")
+    finally:
+        httpx.AsyncClient, srv.RETRY_BASE_DELAY = real_client, real_delay
+
+
+def test_a_400_is_not_retried():
+    calls = []
+
+    class _Client:
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def request(self, method, url, json=None, headers=None):
+            calls.append(url)
+            return httpx.Response(400, json={"detail": "bad"}, request=httpx.Request(method, url))
+
+    real_client = httpx.AsyncClient
+    httpx.AsyncClient = _Client
+    try:
+        asyncio.run(srv._request("POST", "/v1/search", {"query": "x"}))
+    except ApiError:
+        assert len(calls) == 1, "a validation error is the caller's bug; retrying wastes quota"
+    finally:
+        httpx.AsyncClient = real_client
+
+
+def test_rate_limit_parsing_and_enforcement():
+    assert srv._parse_rate_limit("") is None
+    assert srv._parse_rate_limit("100/1h") == (100, 3600.0)
+    assert srv._parse_rate_limit("50/30m") == (50, 1800.0)
+    try:
+        srv._parse_rate_limit("lots")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a malformed rate limit must fail loudly at startup")
+
+    real_limit, real_times = srv.RATE_LIMIT, list(srv._CALL_TIMES)
+    srv.RATE_LIMIT, srv._CALL_TIMES[:] = (2, 3600.0), []
+    try:
+        srv._check_rate_limit()
+        srv._check_rate_limit()
+        try:
+            srv._check_rate_limit()
+        except ApiError as exc:
+            assert "rate limit" in str(exc).lower(), exc
+        else:
+            raise AssertionError("the third call must be refused")
+    finally:
+        srv.RATE_LIMIT, srv._CALL_TIMES[:] = real_limit, real_times
+
+
+def test_the_skill_ships_inside_the_package():
+    text = srv._skill_text()
+    assert not text.startswith("---"), "frontmatter is for a skill loader, not a resource"
+    assert "search" in text and "run_js" in text, text[:200]
 
 
 if __name__ == "__main__":

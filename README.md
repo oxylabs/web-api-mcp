@@ -16,6 +16,32 @@ any MCP-capable agent live web access through the Oxylabs Web API.
 All seven are annotated `readOnlyHint` — nothing here writes anything — so clients can run
 them without prompting.
 
+## The skill ships with the server
+
+Connecting the server is the whole install. The agent skill is bundled in the package and
+served as an MCP resource and a prompt, so a client that never adds the
+[web-api-skills](https://github.com/oxylabs/web-api-skills) repo still gets the judgment
+for using these tools well — search to find and scrape to read, when JavaScript rendering
+earns its cost, what to do with an empty page, how to cite.
+
+| | |
+|---|---|
+| `oxylabs://skill/web-api` | The skill itself, as Markdown |
+| `oxylabs://tools/list` | This server's tools and what each is for |
+| prompt `web_research` | Takes a `question`, hands the agent the task plus the skill |
+
+`scripts/sync-skill.sh` refreshes the bundled copy from the skills repo — the canonical
+copy lives there, and the two must not drift.
+
+## Fitting the client's context
+
+Oversized content is measured in **tokens, not characters**: 40 000 characters of English
+is about 10 000 tokens, but 40 000 characters of Chinese is about 40 000, and Claude Code,
+Claude Desktop and Cursor all reject a tool result over 25 000. The estimate is script-aware
+for that reason. The budget is `OXYLABS_MAX_INLINE_TOKENS` (default 10 000), and a client
+that knows its own limit can override it per request with an `X-MCP-Max-Tokens` header or
+`?max_tokens=` on the URL — `0` opts out entirely.
+
 ## JavaScript rendering is a job, not a wait
 
 `run_js` pages take at least 30 seconds and routinely outlive a tool call. So `scrape(url,
@@ -73,7 +99,7 @@ does not return oversized content inline:
 - **Running remotely (HTTP):** there is no shared filesystem, so a path would be useless.
   The content is truncated with a note stating the full length.
 
-The threshold is `OXYLABS_MAX_INLINE_CHARS` (default 40 000). `read_scraped` can only read
+The threshold is `OXYLABS_MAX_INLINE_TOKENS` (default 10 000). `read_scraped` can only read
 files in the spill directory — it is deliberately not a general file reader.
 
 Full API documentation: **[Oxylabs Web API docs](https://github.com/oxylabs/gitbook-web-api)**
@@ -154,11 +180,15 @@ docker run --rm -p 8080:8080 \
 | `OXYLABS_API_KEY` | *(required on stdio)* | Web API key, sent as `Authorization: Bearer <key>`. Over HTTP a per-request `Authorization: Bearer` header takes precedence |
 | `OXYLABS_BASE_URL` | `https://webapi.oxylabs.io` | Override for staging or a proxy |
 | `OXYLABS_TIMEOUT` | `120` | Per-request timeout in seconds |
+| `OXYLABS_RETRIES` | `2` | Retries on a transient 500/502/503/504 |
+| `OXYLABS_RETRY_BASE_DELAY` | `1` | Seconds before the first retry, doubling after |
+| `OXYLABS_RATE_LIMIT` | *(off)* | Cap this server's own spend, e.g. `100/1h`, `50/30m` |
 | `OXYLABS_JS_TIMEOUT` | `300` | Timeout for background JavaScript-rendering jobs |
 | `OXYLABS_JOB_TTL_MINUTES` | `60` | How long a finished job's result stays pollable |
 | `OXYLABS_THIN_CONTENT_CHARS` | `500` | Below this much visible text, a page is flagged `content_thin` |
 | `OXYLABS_EXTRACT_APPROVAL` | `1` | Set to `0` to skip the user prompt on `extract` |
-| `OXYLABS_MAX_INLINE_CHARS` | `40000` | Above this, content is offloaded or truncated |
+| `OXYLABS_MAX_INLINE_TOKENS` | `10000` | Above this, content is offloaded or truncated |
+| `OXYLABS_READ_CHUNK_CHARS` | `40000` | Default chunk size for `read_scraped` |
 | `OXYLABS_SPILL_DIR` | system temp | Where offloaded pages are written (stdio only) |
 | `OXYLABS_SPILL_TTL_HOURS` | `6` | Offloaded pages older than this are pruned on write |
 | `OXYLABS_SPILL` | `1` | Set to `0` to keep everything inline even on stdio |
@@ -176,6 +206,8 @@ request time and is never written to disk or logged.
   each request and the server uses it for that call, so one deployment serves several
   callers on their own quota. `OXYLABS_API_KEY` in the server environment is the fallback
   when no header arrives.
+- **Cap the spend.** `OXYLABS_RATE_LIMIT=100/1h` refuses tool calls past a sliding window,
+  so a runaway agent loop cannot drain the key. Off by default.
 - **If you rely on that fallback, treat the endpoint as privileged.** The server does no
   authentication of its own — anyone who can reach it spends the key it holds. Put it
   behind your VPN, an ingress with auth, or a service mesh. Don't expose it to the public
@@ -191,6 +223,7 @@ request time and is never written to disk or logged.
 pip install -e '.[dev]'
 ruff check . && ruff format --check .
 pytest                         # or: python tests/test_server.py
+./scripts/sync-skill.sh        # refresh the bundled skill from web-api-skills
 ```
 
 The tests are offline: error parsing, input validation, envelope trimming, endpoint-name
