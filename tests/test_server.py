@@ -329,6 +329,55 @@ def test_extract_approval_can_be_waived_by_the_operator():
         del os.environ["OXYLABS_EXTRACT_APPROVAL"]
 
 
+def _page(content, output="markdown"):
+    return {
+        "results": [{"content": content, "url": "https://ex.com/a"}],
+        "params": {"output": [output]},
+    }
+
+
+def test_an_empty_shell_is_flagged_for_a_js_retry():
+    out = srv._flag_thin_content(_page("# Loading\n\n"))["results"][0]
+    assert out["content_thin"]["visible_chars"] < srv.THIN_CONTENT_CHARS, out
+    assert "run_js=True" in out["content_thin"]["note"]
+
+
+def test_a_real_page_is_left_alone():
+    out = srv._flag_thin_content(_page("word " * 400))["results"][0]
+    assert "content_thin" not in out, out
+
+
+def test_html_is_measured_on_its_visible_text_not_its_markup():
+    shell = (
+        "<html><head>"
+        + '<meta name="x" content="y">' * 60
+        + '</head><body><div id="root"></div><script>var a=1;</script></body></html>'
+    )
+    assert len(shell) > srv.THIN_CONTENT_CHARS
+    out = srv._flag_thin_content(_page(shell, output="html"))["results"][0]
+    assert "content_thin" in out, out
+
+
+def test_a_javascript_notice_is_flagged_even_above_the_length_floor():
+    page = "Home About Contact " * 40 + " You need to enable JavaScript to run this app."
+    assert len(page) > srv.THIN_CONTENT_CHARS
+    out = srv._flag_thin_content(_page(page))["results"][0]
+    assert out["content_thin"]["reason"] == "the page says it needs JavaScript", out
+
+
+def test_a_long_article_about_javascript_is_not_a_shell():
+    article = "Turn on JavaScript to see the demo. " + ("prose " * 2000)
+    out = srv._flag_thin_content(_page(article))["results"][0]
+    assert "content_thin" not in out, out
+
+
+def test_offloaded_pages_are_never_called_thin():
+    payload = _page("x" * (srv.MAX_INLINE_CHARS + 100))
+    srv._SPILL_ENABLED = False
+    out = srv._flag_thin_content(srv._process_content(payload, "markdown"))["results"][0]
+    assert "content_truncated" in out and "content_thin" not in out, out
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

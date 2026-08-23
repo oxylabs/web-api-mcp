@@ -29,6 +29,28 @@ id straight away:
 The agent polls `check_scrape(job_id)` — after ~30s, then every ~15s — and does other work
 in between. Results are kept for `OXYLABS_JOB_TTL_MINUTES` (default 60).
 
+### It says when a page needed rendering
+
+The agent shouldn't have to guess whether an empty page is empty or just unrendered, and it
+shouldn't pay for a render on every page to find out. So a plain `scrape` that comes back
+with almost no visible text — or with a "please enable JavaScript" notice — is flagged:
+
+```jsonc
+{
+  "content": "# Loading…",
+  "content_thin": {
+    "visible_chars": 9,
+    "reason": "almost no text",
+    "note": "…renders client-side. Retry the same call with run_js=True…"
+  }
+}
+```
+
+HTML is measured on its text, not its markup, so a 3 KB shell of `<meta>` tags still reads
+as thin. The flag is a hint, not a retry: rendering is slow and billed, and a genuinely
+short page would pay for it on every fetch. The threshold is `OXYLABS_THIN_CONTENT_CHARS`
+(default 500).
+
 Jobs live in the server process: they do not survive a restart, and they are not shared
 between HTTP replicas. Run one replica, or give it sticky sessions.
 
@@ -134,6 +156,7 @@ docker run --rm -p 8080:8080 \
 | `OXYLABS_TIMEOUT` | `120` | Per-request timeout in seconds |
 | `OXYLABS_JS_TIMEOUT` | `300` | Timeout for background JavaScript-rendering jobs |
 | `OXYLABS_JOB_TTL_MINUTES` | `60` | How long a finished job's result stays pollable |
+| `OXYLABS_THIN_CONTENT_CHARS` | `500` | Below this much visible text, a page is flagged `content_thin` |
 | `OXYLABS_EXTRACT_APPROVAL` | `1` | Set to `0` to skip the user prompt on `extract` |
 | `OXYLABS_MAX_INLINE_CHARS` | `40000` | Above this, content is offloaded or truncated |
 | `OXYLABS_SPILL_DIR` | system temp | Where offloaded pages are written (stdio only) |

@@ -46,6 +46,14 @@ JOB_TTL_SECONDS = float(os.environ.get("OXYLABS_JOB_TTL_MINUTES", "60")) * 60
 # Content larger than this is offloaded to disk (local) or truncated (remote).
 MAX_INLINE_CHARS = int(os.environ.get("OXYLABS_MAX_INLINE_CHARS", "40000"))
 PREVIEW_CHARS = 2000
+
+# Below this much visible text, a page fetched without JavaScript is probably a shell.
+THIN_CONTENT_CHARS = int(os.environ.get("OXYLABS_THIN_CONTENT_CHARS", "500"))
+JS_REQUIRED_RE = re.compile(
+    r"(enable|turn on|requires?|needs?)\s+(?:\w+\s+){0,3}javascript|javascript\s+is\s+"
+    r"(?:required|disabled|turned off)|<noscript",
+    re.IGNORECASE,
+)
 SPILL_TTL_SECONDS = float(os.environ.get("OXYLABS_SPILL_TTL_HOURS", "6")) * 3600
 
 # Writing scraped pages to disk only makes sense when the agent shares a filesystem with
@@ -307,6 +315,62 @@ def _process_content(payload: dict[str, Any], fmt: str) -> dict[str, Any]:
     return payload
 
 
+def _visible_text(content: str, fmt: str) -> str:
+    """Roughly what a reader would see. A heuristic for one hint, not a parser."""
+    if fmt == "html":
+        content = re.sub(r"(?is)<(script|style|noscript)\b.*?</\1>", " ", content)
+        content = re.sub(r"<[^>]+>", " ", content)
+    return " ".join(content.split())
+
+
+def _flag_thin_content(payload: dict[str, Any]) -> dict[str, Any]:
+    """Point out a page that came back empty, so the agent knows `run_js` is worth a try.
+
+    A client-side-rendered page fetched without JavaScript returns a shell: a few hundred
+    characters of chrome and nothing to read. That is indistinguishable from a genuinely
+    short page to anything but the agent, so this flags it rather than retrying — a
+    silent retry would double the cost and the wait on every short page.
+    """
+    results = payload.get("results")
+    if not isinstance(results, list):
+        return payload
+
+    fmt = "markdown"
+    output = payload.get("params", {}).get(OUTPUT_PARAM)
+    if isinstance(output, list) and output:
+        fmt = str(output[0])
+
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        content = result.get("content")
+        # Offloaded content is, by definition, not thin.
+        if not isinstance(content, str) or "content_offloaded" in result:
+            continue
+
+        text = _visible_text(content, fmt)
+        # The JS notice is checked against the raw content so a <noscript> block counts,
+        # and only on a shortish page — a long article *about* JavaScript is not a shell.
+        asks_for_js = (
+            len(text) < THIN_CONTENT_CHARS * 10 and JS_REQUIRED_RE.search(content) is not None
+        )
+        if len(text) >= THIN_CONTENT_CHARS and not asks_for_js:
+            continue
+
+        result["content_thin"] = {
+            "visible_chars": len(text),
+            "reason": "the page says it needs JavaScript" if asks_for_js else "almost no text",
+            "note": (
+                "This page returned no readable content, which usually means it renders "
+                "client-side. Retry the same call with run_js=True — that returns a job "
+                "id to poll with `check_scrape`, and takes ~30s or more. If the page is "
+                "genuinely this short, take it at face value: do not retry twice, and do "
+                "not fall back to your own recollection of what the page says."
+            ),
+        }
+    return payload
+
+
 def _trim(payload: dict[str, Any]) -> dict[str, Any]:
     """Drop envelope fields the agent gains nothing from re-reading.
 
@@ -452,8 +516,10 @@ async def scrape(
     The API renders Markdown for you, and that is the default here: far fewer tokens than
     HTML and no markup to wade through.
 
-    With `run_js` this returns a job id rather than content — rendering is too slow to
-    hold a tool call open. Poll it with `check_scrape`.
+    Try it without `run_js` first. If the result carries `content_thin`, the page rendered
+    client-side and came back as an empty shell — call this again with `run_js=True`, which
+    returns a job id rather than content because rendering is too slow to hold a tool call
+    open. Poll that id with `check_scrape`.
 
     Very large pages are not returned inline. When this server runs locally they are
     written to disk and you get a preview plus a path to read in chunks with
@@ -480,7 +546,8 @@ async def scrape(
         return _submit_job("/v1/scrape", payload, format, _api_key(ctx))
 
     await _note(ctx, f"Scraping {url} as {format}")
-    return _trim(_process_content(await _request("POST", "/v1/scrape", payload, ctx=ctx), format))
+    response = _process_content(await _request("POST", "/v1/scrape", payload, ctx=ctx), format)
+    return _trim(_flag_thin_content(response))
 
 
 class _ExtractApproval(BaseModel):
@@ -707,7 +774,8 @@ async def scrape_target(
         return _submit_job(f"/v1/{name}", params, fmt, _api_key(ctx))
 
     await _note(ctx, f"Running /v1/{name}")
-    return _trim(_process_content(await _request("POST", f"/v1/{name}", params, ctx=ctx), fmt))
+    response = _process_content(await _request("POST", f"/v1/{name}", params, ctx=ctx), fmt)
+    return _trim(_flag_thin_content(response))
 
 
 def _endpoint_name(endpoint: str) -> str:
