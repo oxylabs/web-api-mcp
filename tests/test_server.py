@@ -13,7 +13,16 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 os.environ.setdefault("OXYLABS_API_KEY", "test-key")
 
 import oxylabs_web_api_mcp.server as srv  # noqa: E402
-from oxylabs_web_api_mcp.server import ApiError, _detail, read_scraped, scrape, search  # noqa: E402
+from oxylabs_web_api_mcp.server import (  # noqa: E402
+    ApiError,
+    _detail,
+    check_scrape,
+    extract,
+    read_scraped,
+    scrape,
+    scrape_target,
+    search,
+)
 
 
 def _resp(status: int, json_body=None, text: str = "") -> httpx.Response:
@@ -38,7 +47,11 @@ def test_detail_falls_back_to_message_then_text():
 
 
 def test_search_rejects_bad_input_before_calling_the_api():
-    for kwargs in ({"query": "   "}, {"query": "ok", "max_results": 0}, {"query": "ok", "max_results": 21}):
+    for kwargs in (
+        {"query": "   "},
+        {"query": "ok", "max_results": 0},
+        {"query": "ok", "max_results": 21},
+    ):
         try:
             asyncio.run(search(**kwargs))
         except ApiError:
@@ -119,6 +132,201 @@ def test_scrape_rejects_unknown_format():
     except ApiError:
         return
     raise AssertionError("expected ApiError for an unsupported format")
+
+
+# --------------------------------------------------------------------- new behaviour
+
+
+class _FakeCtx:
+    """Just enough Context for the bits that read headers and capabilities."""
+
+    def __init__(self, headers=None, elicitation=None, answer=None):
+        self.headers = headers
+        self.client_capabilities = type("Caps", (), {"elicitation": elicitation})()
+        self._answer = answer
+        self.messages = []
+
+    async def info(self, message):
+        self.messages.append(message)
+
+    async def elicit(self, message, schema):
+        action, proceed = self._answer
+        data = type("Data", (), {"proceed": proceed})()
+        return type("Result", (), {"action": action, "data": data})()
+
+
+def test_bearer_header_beats_the_environment():
+    ctx = _FakeCtx(headers={"authorization": "Bearer from-header"})
+    assert srv._api_key(ctx) == "from-header"
+    # No usable header falls back to the environment.
+    assert srv._api_key(_FakeCtx(headers={"authorization": "Basic nope"})) == "test-key"
+    assert srv._api_key(None) == "test-key"
+
+
+def test_missing_key_everywhere_is_an_actionable_error():
+    saved = os.environ.pop("OXYLABS_API_KEY")
+    try:
+        srv._api_key(_FakeCtx())
+    except ApiError as exc:
+        assert "Authorization: Bearer" in str(exc), exc
+    else:
+        raise AssertionError("expected ApiError when no key is available")
+    finally:
+        os.environ["OXYLABS_API_KEY"] = saved
+
+
+def test_trim_drops_the_echo_but_keeps_the_request_id():
+    out = srv._trim(
+        {
+            "status": "done",
+            "results": [1],
+            "params": {"query": "x"},
+            "metadata": {"timestamp": 1, "request_id": "abc"},
+        }
+    )
+    assert out == {"status": "done", "results": [1], "request_id": "abc"}, out
+    # Nothing to keep is fine too.
+    assert srv._trim({"results": []}) == {"results": []}
+
+
+def test_endpoint_names_cannot_walk_the_path():
+    assert srv._endpoint_name("scrape") == "scrape"
+    assert srv._endpoint_name("/v1/amazon_search/") == "amazon_search"
+    for bad in ("../admin", "scrape?x=1", "v1/../../etc", "HTTP://evil", ""):
+        try:
+            srv._endpoint_name(bad)
+        except ApiError:
+            continue
+        raise AssertionError(f"_endpoint_name must refuse {bad!r}")
+
+
+def _run_js_job(call):
+    """Run a run_js tool call against a stubbed API and poll it to completion."""
+
+    async def fake_request(method, path, payload=None, **kwargs):
+        return {"results": [{"content": "rendered", "url": payload["url"]}], "params": payload}
+
+    real = srv._request
+    srv._request = fake_request
+    try:
+        started = asyncio.run(call())
+        assert started["status"] == "running" and started["job_id"], started
+
+        async def drain():
+            await srv._JOBS[started["job_id"]]["task"]
+            return await check_scrape(started["job_id"])
+
+        return started, asyncio.run(drain())
+    finally:
+        srv._request = real
+
+
+def test_run_js_returns_a_job_to_poll_and_then_the_content():
+    started, done = _run_js_job(lambda: scrape("https://ex.com", run_js=True))
+    assert "check_scrape" in started["note"]
+    assert done["status"] == "done"
+    assert done["result"]["results"][0]["content"] == "rendered", done
+    # The envelope echo is gone by the time the agent sees it.
+    assert "params" not in done["result"]
+
+
+def test_scrape_target_routes_run_js_through_the_same_job_path():
+    started, done = _run_js_job(
+        lambda: scrape_target("amazon_search", {"url": "https://ex.com", "run_js": True})
+    )
+    assert done["status"] == "done" and started["status"] == "running"
+
+
+def test_check_scrape_reports_a_failed_job_instead_of_hanging():
+    async def failing(method, path, payload=None, **kwargs):
+        raise ApiError("upstream exploded")
+
+    real = srv._request
+    srv._request = failing
+    try:
+        started = asyncio.run(scrape("https://ex.com", run_js=True))
+
+        async def drain():
+            await srv._JOBS[started["job_id"]]["task"]
+            return await check_scrape(started["job_id"])
+
+        try:
+            asyncio.run(drain())
+        except ApiError as exc:
+            assert "upstream exploded" in str(exc), exc
+        else:
+            raise AssertionError("a failed job must surface as an error, not a result")
+    finally:
+        srv._request = real
+
+
+def test_check_scrape_rejects_an_unknown_job():
+    try:
+        asyncio.run(check_scrape("nope"))
+    except ApiError:
+        return
+    raise AssertionError("expected ApiError for an unknown job id")
+
+
+def test_extract_needs_the_user_to_approve_the_extra_cost():
+    calls = []
+
+    async def fake_request(method, path, payload=None, **kwargs):
+        calls.append(payload)
+        return {"results": [{"content": {"title": "t"}}], "params": payload}
+
+    real = srv._request
+    srv._request = fake_request
+    try:
+        # Declined: nothing is billed.
+        try:
+            asyncio.run(
+                extract(
+                    "https://ex.com",
+                    "the title",
+                    ctx=_FakeCtx(elicitation={}, answer=("decline", False)),
+                )
+            )
+        except ApiError as exc:
+            assert "declined" in str(exc), exc
+        else:
+            raise AssertionError("a declined elicitation must stop the call")
+        assert not calls, "declining must not reach the API"
+
+        # A client that cannot ask is refused rather than billed silently.
+        try:
+            asyncio.run(extract("https://ex.com", "the title", ctx=_FakeCtx()))
+        except ApiError as exc:
+            assert "elicitation" in str(exc), exc
+        else:
+            raise AssertionError("no elicitation support must stop the call")
+        assert not calls
+
+        # Accepted: the prompt goes out as a json output request.
+        out = asyncio.run(
+            extract(
+                "https://ex.com", "the title", ctx=_FakeCtx(elicitation={}, answer=("accept", True))
+            )
+        )
+        assert calls[0]["json"] == {"prompt": "the title"}, calls
+        assert calls[0][srv.OUTPUT_PARAM] == ["json"]
+        assert out["results"][0]["content"] == {"title": "t"}
+    finally:
+        srv._request = real
+
+
+def test_extract_approval_can_be_waived_by_the_operator():
+    async def fake_request(method, path, payload=None, **kwargs):
+        return {"results": [{"content": {}}], "params": payload}
+
+    real = srv._request
+    srv._request = fake_request
+    os.environ["OXYLABS_EXTRACT_APPROVAL"] = "0"
+    try:
+        asyncio.run(extract("https://ex.com", "the title"))
+    finally:
+        srv._request = real
+        del os.environ["OXYLABS_EXTRACT_APPROVAL"]
 
 
 if __name__ == "__main__":

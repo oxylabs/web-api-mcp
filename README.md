@@ -7,8 +7,38 @@ any MCP-capable agent live web access through the Oxylabs Web API.
 |---|---|
 | `search` | Search the live web, returns ranked organic results (title, description, URL) |
 | `scrape` | Read a single URL as **Markdown** by default, including JS-heavy and bot-protected pages |
+| `extract` | Pull named fields off a page as JSON, no selectors. Billed above a scrape, so the user approves each run |
+| `check_scrape` | Collect the result of a JavaScript-rendering job |
 | `read_scraped` | Read a large page that was offloaded to disk, in chunks |
-| `list_scrapers` | List the scrape endpoints the API implements |
+| `list_scrapers` | List the scrape endpoints the API implements, or describe one's parameters |
+| `scrape_target` | Call a target-specific scrape endpoint with its own parameters |
+
+All seven are annotated `readOnlyHint` — nothing here writes anything — so clients can run
+them without prompting.
+
+## JavaScript rendering is a job, not a wait
+
+`run_js` pages take at least 30 seconds and routinely outlive a tool call. So `scrape(url,
+run_js=True)` (and `extract`, and `scrape_target` with `run_js` in its params) returns a job
+id straight away:
+
+```json
+{ "job_id": "9f3c1a20b7d4", "status": "running", "url": "https://example.com" }
+```
+
+The agent polls `check_scrape(job_id)` — after ~30s, then every ~15s — and does other work
+in between. Results are kept for `OXYLABS_JOB_TTL_MINUTES` (default 60).
+
+Jobs live in the server process: they do not survive a restart, and they are not shared
+between HTTP replicas. Run one replica, or give it sticky sessions.
+
+## Structured extraction costs extra
+
+`extract(url, prompt)` returns the fields you name as JSON instead of a page to read. The
+page is parsed by a model per call, which is billed above a plain `scrape`, so the server
+asks the user to approve each run over MCP elicitation. Clients that can't elicit get an
+error explaining why rather than a silent charge; `OXYLABS_EXTRACT_APPROVAL=0` waives the
+prompt once the user has agreed to the cost.
 
 ## Large pages
 
@@ -39,6 +69,10 @@ git clone https://github.com/oxylabs/web-api-mcp.git
 cd web-api-mcp
 pip install .
 ```
+
+`server.json` is the [MCP registry](https://github.com/modelcontextprotocol/registry)
+manifest. It has no `packages` block yet — add one once the server is published somewhere
+installable, since a registry entry pointing at nothing is worse than no entry.
 
 ## Use it locally (stdio)
 
@@ -95,9 +129,12 @@ docker run --rm -p 8080:8080 \
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `OXYLABS_API_KEY` | *(required)* | Web API key, sent as `Authorization: Bearer <key>` |
+| `OXYLABS_API_KEY` | *(required on stdio)* | Web API key, sent as `Authorization: Bearer <key>`. Over HTTP a per-request `Authorization: Bearer` header takes precedence |
 | `OXYLABS_BASE_URL` | `https://webapi.oxylabs.io` | Override for staging or a proxy |
 | `OXYLABS_TIMEOUT` | `120` | Per-request timeout in seconds |
+| `OXYLABS_JS_TIMEOUT` | `300` | Timeout for background JavaScript-rendering jobs |
+| `OXYLABS_JOB_TTL_MINUTES` | `60` | How long a finished job's result stays pollable |
+| `OXYLABS_EXTRACT_APPROVAL` | `1` | Set to `0` to skip the user prompt on `extract` |
 | `OXYLABS_MAX_INLINE_CHARS` | `40000` | Above this, content is offloaded or truncated |
 | `OXYLABS_SPILL_DIR` | system temp | Where offloaded pages are written (stdio only) |
 | `OXYLABS_SPILL_TTL_HOURS` | `6` | Offloaded pages older than this are pruned on write |
@@ -112,10 +149,14 @@ request time and is never written to disk or logged.
 
 ## Security notes
 
-- **The server holds your API key, so treat its endpoint as privileged.** It performs no
-  authentication of its own — anyone who can reach the HTTP endpoint can spend your quota.
-  Put it behind your VPN, an ingress with auth, or a service mesh. Don't expose it to the
-  public internet.
+- **Callers can bring their own key over HTTP.** Send `Authorization: Bearer <key>` with
+  each request and the server uses it for that call, so one deployment serves several
+  callers on their own quota. `OXYLABS_API_KEY` in the server environment is the fallback
+  when no header arrives.
+- **If you rely on that fallback, treat the endpoint as privileged.** The server does no
+  authentication of its own — anyone who can reach it spends the key it holds. Put it
+  behind your VPN, an ingress with auth, or a service mesh. Don't expose it to the public
+  internet.
 - `scrape` fetches whatever URL it is given. If you expose this server to untrusted
   prompts, restrict egress at the network layer rather than trusting the caller.
 - `read_scraped` is restricted to the spill directory. Don't point `OXYLABS_SPILL_DIR` at a
@@ -125,8 +166,13 @@ request time and is never written to disk or logged.
 
 ```bash
 pip install -e '.[dev]'
-python tests/test_server.py    # offline checks: error parsing + input validation
+ruff check . && ruff format --check .
+pytest                         # or: python tests/test_server.py
 ```
+
+The tests are offline: error parsing, input validation, envelope trimming, endpoint-name
+handling, the job lifecycle and the `extract` approval gate. CI runs the same on 3.10,
+3.12 and 3.13.
 
 ## License
 
