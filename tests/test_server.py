@@ -12,7 +12,8 @@ import httpx
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 os.environ.setdefault("OXYLABS_API_KEY", "test-key")
 
-from oxylabs_web_api_mcp.server import ApiError, _detail, scrape, search  # noqa: E402
+import oxylabs_web_api_mcp.server as srv  # noqa: E402
+from oxylabs_web_api_mcp.server import ApiError, _detail, read_scraped, scrape, search  # noqa: E402
 
 
 def _resp(status: int, json_body=None, text: str = "") -> httpx.Response:
@@ -51,6 +52,73 @@ def test_scrape_rejects_relative_urls():
     except ApiError:
         return
     raise AssertionError("expected ApiError for a non-absolute URL")
+
+
+def _big_payload(chars: int) -> dict:
+    return {
+        "status": "done",
+        "results": [{"content": "x" * chars, "url": "https://ex.com/a"}],
+        "params": {"url": "https://ex.com/a"},
+    }
+
+
+def test_oversized_content_spills_to_disk_when_local(tmp_dir=None):
+    import tempfile
+
+    spill = tmp_dir or tempfile.mkdtemp()
+    os.environ["OXYLABS_SPILL_DIR"] = spill
+    srv._SPILL_ENABLED = True
+    try:
+        size = srv.MAX_INLINE_CHARS + 5000
+        out = srv._process_content(_big_payload(size), "markdown")
+        result = out["results"][0]
+        info = result["content_offloaded"]
+
+        assert info["total_chars"] == size, info
+        assert len(result["content"]) == srv.PREVIEW_CHARS, len(result["content"])
+        assert "content_truncated" not in result
+        assert os.path.isfile(info["path"]), info
+
+        # The agent walks the file in chunks and reaches the end.
+        first = asyncio.run(read_scraped(info["path"], offset=0, length=1000))
+        assert first["returned_chars"] == 1000 and not first["eof"], first
+        last = asyncio.run(read_scraped(info["path"], offset=size - 10, length=1000))
+        assert last["eof"] and last["returned_chars"] == 10, last
+    finally:
+        srv._SPILL_ENABLED = False
+        del os.environ["OXYLABS_SPILL_DIR"]
+
+
+def test_oversized_content_truncates_when_remote():
+    srv._SPILL_ENABLED = False
+    size = srv.MAX_INLINE_CHARS + 5000
+    result = srv._process_content(_big_payload(size), "markdown")["results"][0]
+    assert result["content_truncated"]["total_chars"] == size
+    assert len(result["content"]) == srv.MAX_INLINE_CHARS
+    assert "content_offloaded" not in result
+
+
+def test_small_content_is_left_alone():
+    out = srv._process_content(_big_payload(100), "markdown")["results"][0]
+    assert out["content"] == "x" * 100
+    assert "content_offloaded" not in out and "content_truncated" not in out
+
+
+def test_read_scraped_refuses_paths_outside_the_spill_dir():
+    for bad in ("/etc/passwd", "/etc/hosts.txt", os.path.join(os.getcwd(), "pyproject.toml")):
+        try:
+            asyncio.run(read_scraped(bad))
+        except ApiError:
+            continue
+        raise AssertionError(f"read_scraped must refuse {bad}")
+
+
+def test_scrape_rejects_unknown_format():
+    try:
+        asyncio.run(scrape("https://ex.com", format="pdf"))
+    except ApiError:
+        return
+    raise AssertionError("expected ApiError for an unsupported format")
 
 
 if __name__ == "__main__":

@@ -12,7 +12,12 @@ Run:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
+import os.path
+import tempfile
+import time
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -21,6 +26,19 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 BASE_URL = os.environ.get("OXYLABS_BASE_URL", "https://webapi.oxylabs.io").rstrip("/")
 TIMEOUT = float(os.environ.get("OXYLABS_TIMEOUT", "120"))
+
+# Content larger than this is offloaded to disk (local) or truncated (remote).
+MAX_INLINE_CHARS = int(os.environ.get("OXYLABS_MAX_INLINE_CHARS", "40000"))
+PREVIEW_CHARS = 2000
+SPILL_TTL_SECONDS = float(os.environ.get("OXYLABS_SPILL_TTL_HOURS", "6")) * 3600
+
+# Writing scraped pages to disk only makes sense when the agent shares a filesystem with
+# this server, i.e. stdio. A remote HTTP server hands back a path nobody can open, so it
+# truncates instead. main() flips this on; the safe default is off.
+_SPILL_ENABLED = False
+
+# The API renders the requested formats server-side via `output`, which takes a list.
+OUTPUT_PARAM = "output"
 
 mcp = MCPServer(
     name="oxylabs-web-api",
@@ -91,6 +109,86 @@ async def _request(method: str, path: str, payload: dict[str, Any] | None = None
     return _check(resp, path)
 
 
+# --------------------------------------------------------------------------- content
+
+
+def _spill_dir() -> Path:
+    path = Path(
+        os.environ.get("OXYLABS_SPILL_DIR", Path(tempfile.gettempdir()) / "oxylabs-web-api-mcp")
+    )
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _prune_spills(directory: Path) -> None:
+    """Delete spill files older than the TTL. Cheap enough to run on every write."""
+    cutoff = time.time() - SPILL_TTL_SECONDS
+    for stale in directory.glob("*.txt"):
+        try:
+            if stale.stat().st_mtime < cutoff:
+                stale.unlink()
+        except OSError:
+            pass  # Another process got there first, or the file is not ours to remove.
+
+
+def _spill(text: str, url: str, fmt: str) -> Path:
+    """Write oversized content to the spill dir and return its path."""
+    directory = _spill_dir()
+    _prune_spills(directory)
+    stem = hashlib.sha256(url.encode()).hexdigest()[:16]
+    path = directory / f"{stem}.{'md' if fmt == 'markdown' else 'html'}.txt"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _offload(result: dict[str, Any], text: str, url: str, fmt: str) -> None:
+    """Replace oversized `content` in place with a pointer or a truncation notice."""
+    if _SPILL_ENABLED:
+        path = _spill(text, url, fmt)
+        result["content"] = text[:PREVIEW_CHARS]
+        result["content_offloaded"] = {
+            "path": str(path),
+            "format": fmt,
+            "total_chars": len(text),
+            "preview_chars": min(PREVIEW_CHARS, len(text)),
+            "note": (
+                "`content` above is only the first "
+                f"{min(PREVIEW_CHARS, len(text))} characters. The full page is on disk. "
+                "Read it with the `read_scraped` tool: read_scraped(path, offset=0), then "
+                "keep calling it with the `next_offset` it returns until `eof` is true. "
+                "Read only as far as you need — do not pull the whole file in by reflex."
+            ),
+        }
+    else:
+        result["content"] = text[:MAX_INLINE_CHARS]
+        result["content_truncated"] = {
+            "total_chars": len(text),
+            "returned_chars": MAX_INLINE_CHARS,
+            "note": (
+                "Content exceeded the inline limit and was truncated. This server runs over "
+                "HTTP, so it cannot hand back a file path the caller could open. Run the "
+                "server over stdio to get full pages offloaded to disk instead."
+            ),
+        }
+
+
+def _process_content(payload: dict[str, Any], fmt: str) -> dict[str, Any]:
+    """Offload or truncate oversized page content. No reformatting happens here —
+    the API renders the requested format server-side."""
+    results = payload.get("results")
+    if not isinstance(results, list):
+        return payload
+
+    requested_url = str(payload.get("params", {}).get("url", ""))
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        content = result.get("content")
+        if isinstance(content, str) and len(content) > MAX_INLINE_CHARS:
+            _offload(result, content, str(result.get("url") or requested_url), fmt)
+    return payload
+
+
 @mcp.tool()
 async def search(query: str, max_results: int = 10, location: str | None = None) -> dict[str, Any]:
     """Search the live web and return ranked organic results.
@@ -115,18 +213,86 @@ async def search(query: str, max_results: int = 10, location: str | None = None)
 
 
 @mcp.tool()
-async def scrape(url: str) -> dict[str, Any]:
-    """Fetch and parse a single URL, including JavaScript-heavy and bot-protected pages.
+async def scrape(
+    url: str,
+    format: str = "markdown",
+    location: str | None = None,
+    device: str | None = None,
+) -> dict[str, Any]:
+    """Fetch and read a single URL, including JavaScript-heavy and bot-protected pages.
 
-    Use this to read a page's actual content after `search` has told you which URL to read,
-    or whenever the user gives you a URL directly.
+    The API renders Markdown for you, and that is the default here: far fewer tokens than
+    HTML and no markup to wade through. Ask for HTML only when you need the markup itself,
+    e.g. to inspect attributes or embedded data.
+
+    Very large pages are not returned inline. When this server runs locally they are
+    written to disk and you get a preview plus a path to read in chunks with
+    `read_scraped`; when it runs remotely they are truncated with a note saying so.
 
     Args:
         url: Absolute http(s) URL of the page to read.
+        format: "markdown" (default) or "html".
+        location: Two-letter country code to fetch the page from, e.g. "DE". Use it when
+            the page varies by country — pricing, availability, language.
+        device: "desktop" (default upstream) or "mobile".
     """
     if not url.startswith(("http://", "https://")):
         raise ApiError(f"`url` must be an absolute http(s) URL, got: {url!r}")
-    return await _request("POST", "/v1/scrape", {"url": url})
+    if format not in ("markdown", "html"):
+        raise ApiError(f'`format` must be "markdown" or "html", got: {format!r}')
+    if device is not None and device not in ("desktop", "mobile"):
+        raise ApiError(f'`device` must be "desktop" or "mobile", got: {device!r}')
+
+    payload: dict[str, Any] = {"url": url, OUTPUT_PARAM: [format]}
+    if location:
+        payload["location"] = location
+    if device:
+        payload["device"] = device
+
+    return _process_content(await _request("POST", "/v1/scrape", payload), format)
+
+
+@mcp.tool()
+async def read_scraped(path: str, offset: int = 0, length: int = MAX_INLINE_CHARS) -> dict[str, Any]:
+    """Read a chunk of a scraped page that was offloaded to disk.
+
+    Use the `path` from a scrape result's `content_offloaded`. Start at offset 0 and keep
+    calling with the returned `next_offset` until `eof` is true — and stop as soon as you
+    have what you need rather than reading the whole file by reflex.
+
+    Args:
+        path: Path from `content_offloaded.path`.
+        offset: Character offset to start at (default 0).
+        length: How many characters to return (default matches the inline limit).
+    """
+    if offset < 0 or length <= 0:
+        raise ApiError("`offset` must be >= 0 and `length` must be > 0.")
+
+    # Only files this server wrote are readable — this tool is not a general file reader.
+    directory = _spill_dir().resolve()
+    target = Path(path).expanduser().resolve()
+    if directory != target.parent or not target.name.endswith(".txt"):
+        raise ApiError(
+            f"Refusing to read {path!r}: only scraped pages under {directory} can be read "
+            "with this tool. Use the exact path from `content_offloaded.path`."
+        )
+    if not target.is_file():
+        raise ApiError(
+            f"{path!r} no longer exists. Offloaded pages are temporary — scrape the URL again."
+        )
+
+    text = target.read_text(encoding="utf-8", errors="replace")
+    chunk = text[offset : offset + length]
+    next_offset = offset + len(chunk)
+    return {
+        "path": str(target),
+        "offset": offset,
+        "returned_chars": len(chunk),
+        "total_chars": len(text),
+        "next_offset": next_offset,
+        "eof": next_offset >= len(text),
+        "text": chunk,
+    }
 
 
 @mcp.tool()
@@ -163,6 +329,10 @@ def main() -> None:
     parser.add_argument("--host", default=os.environ.get("HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8080")))
     args = parser.parse_args()
+
+    # Offloading to disk is only useful when the agent can open the file, i.e. same host.
+    global _SPILL_ENABLED
+    _SPILL_ENABLED = args.transport == "stdio" and os.environ.get("OXYLABS_SPILL", "1") != "0"
 
     if args.transport == "streamable-http":
         mcp.run(

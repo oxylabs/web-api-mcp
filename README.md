@@ -6,15 +6,31 @@ any MCP-capable agent live web access through the Oxylabs Web API.
 | Tool | What it does |
 |---|---|
 | `search` | Search the live web, returns ranked organic results (title, description, URL) |
-| `scrape` | Fetch and parse a single URL, including JS-heavy and bot-protected pages |
+| `scrape` | Read a single URL as **Markdown** by default, including JS-heavy and bot-protected pages |
+| `read_scraped` | Read a large page that was offloaded to disk, in chunks |
 | `list_scrapers` | List the scrape endpoints the API implements |
+
+## Large pages
+
+Web pages routinely exceed what is sensible to hand an agent in one response, so `scrape`
+does not return oversized content inline:
+
+- **Running locally (stdio):** the page is written to a temp file. The agent gets the first
+  2 000 characters plus a path, and pulls the rest through `read_scraped(path, offset)` —
+  reading only as far as it needs instead of paying for the whole page up front.
+- **Running remotely (HTTP):** there is no shared filesystem, so a path would be useless.
+  The content is truncated with a note stating the full length.
+
+The threshold is `OXYLABS_MAX_INLINE_CHARS` (default 40 000). `read_scraped` can only read
+files in the spill directory — it is deliberately not a general file reader.
 
 Full API documentation: **[Oxylabs Web API docs](https://github.com/nedasvi/project-search-docs)**
 
 ## Requirements
 
 - Python 3.10+
-- An Oxylabs Web API key
+- An Oxylabs Web API key — in the [Oxylabs dashboard](https://dashboard.oxylabs.io), create
+  a **Web API** instance and generate a key for it
 
 ## Install
 
@@ -82,6 +98,10 @@ docker run --rm -p 8080:8080 \
 | `OXYLABS_API_KEY` | *(required)* | Web API key, sent as `Authorization: Bearer <key>` |
 | `OXYLABS_BASE_URL` | `https://webapi.oxylabs.io` | Override for staging or a proxy |
 | `OXYLABS_TIMEOUT` | `120` | Per-request timeout in seconds |
+| `OXYLABS_MAX_INLINE_CHARS` | `40000` | Above this, content is offloaded or truncated |
+| `OXYLABS_SPILL_DIR` | system temp | Where offloaded pages are written (stdio only) |
+| `OXYLABS_SPILL_TTL_HOURS` | `6` | Offloaded pages older than this are pruned on write |
+| `OXYLABS_SPILL` | `1` | Set to `0` to keep everything inline even on stdio |
 | `MCP_TRANSPORT` | `stdio` | `stdio` or `streamable-http` |
 | `HOST` / `PORT` | `127.0.0.1` / `8080` | HTTP transport bind address |
 | `MCP_ALLOWED_HOSTS` | `localhost:*,127.0.0.1:*` | Comma-separated `Host` allowlist (HTTP only) |
@@ -98,6 +118,8 @@ request time and is never written to disk or logged.
   public internet.
 - `scrape` fetches whatever URL it is given. If you expose this server to untrusted
   prompts, restrict egress at the network layer rather than trusting the caller.
+- `read_scraped` is restricted to the spill directory. Don't point `OXYLABS_SPILL_DIR` at a
+  directory holding anything else — it would make those files readable by the agent.
 
 ## Development
 
