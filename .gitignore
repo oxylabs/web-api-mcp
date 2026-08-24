@@ -9,3 +9,7 @@ build/
 *.egg-info/
 .pytest_cache/
 .ruff_cache/
+# Nothing consumes this: CI and the Dockerfile both install with pip, and CI resolves
+# fresh against three Python versions on purpose so upstream breakage shows up there.
+# A tracked lock nobody validates only rots.
+uv.lock

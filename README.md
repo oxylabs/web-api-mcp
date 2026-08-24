@@ -106,7 +106,7 @@ Full API documentation: **[Oxylabs Web API docs](https://github.com/oxylabs/gitb
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.10+ (built on [FastMCP](https://gofastmcp.com), installed with the package)
 - An Oxylabs Web API key — in the [Oxylabs dashboard](https://dashboard.oxylabs.io), create
   a **Web API** instance and generate a key for it
 
@@ -128,7 +128,7 @@ Point your client at the installed command. Claude Code:
 
 ```bash
 claude mcp add oxylabs-web-api \
-  --env OXYLABS_API_KEY=your_api_key_here \
+  --env OXYLABS_WEB_API_KEY=your_api_key_here \
   -- oxylabs-web-api-mcp
 ```
 
@@ -139,7 +139,7 @@ Claude Desktop / Cursor / any client that reads a JSON config:
   "mcpServers": {
     "oxylabs-web-api": {
       "command": "oxylabs-web-api-mcp",
-      "env": { "OXYLABS_API_KEY": "your_api_key_here" }
+      "env": { "OXYLABS_WEB_API_KEY": "your_api_key_here" }
     }
   }
 }
@@ -151,9 +151,9 @@ The HTTP transport is for running one shared server for a team or for agents tha
 can't spawn local processes.
 
 ```bash
-export OXYLABS_API_KEY=your_api_key_here
+export OXYLABS_WEB_API_KEY=your_api_key_here
 export MCP_ALLOWED_HOSTS='mcp.internal.example.com,localhost:*'
-oxylabs-web-api-mcp --transport streamable-http --host 0.0.0.0 --port 8080
+oxylabs-web-api-mcp --transport http --host 0.0.0.0 --port 8080
 ```
 
 The endpoint is then `http://<host>:8080/mcp`.
@@ -163,21 +163,21 @@ The endpoint is then `http://<host>:8080/mcp`.
 ```bash
 docker build -t oxylabs-web-api-mcp .
 docker run --rm -p 8080:8080 \
-  -e OXYLABS_API_KEY=your_api_key_here \
+  -e OXYLABS_WEB_API_KEY=your_api_key_here \
   -e MCP_ALLOWED_HOSTS='localhost:*,mcp.internal.example.com' \
   oxylabs-web-api-mcp
 ```
 
-> **`MCP_ALLOWED_HOSTS` is not optional.** The MCP SDK enables DNS-rebinding protection
-> with an empty allowlist, so a server that doesn't declare its own hostname rejects
-> every request with a `Host` header it doesn't recognise. List the hostname clients
-> actually connect to. `host:*` matches any port on that host.
+> **`MCP_ALLOWED_HOSTS` is not optional.** The HTTP transport turns on DNS-rebinding
+> protection, so a server that doesn't declare its own hostname rejects every request
+> with a `Host` header it doesn't recognise (`421 Misdirected Request`). List the
+> hostname clients actually connect to. `host:*` matches any port on that host.
 
 ## Configuration
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `OXYLABS_API_KEY` | *(required on stdio)* | Web API key, sent as `Authorization: Bearer <key>`. Over HTTP a per-request `Authorization: Bearer` header takes precedence |
+| `OXYLABS_WEB_API_KEY` | *(required on stdio)* | Web API key, sent as `Authorization: Bearer <key>`. Over HTTP a per-request `Authorization: Bearer` header takes precedence |
 | `OXYLABS_BASE_URL` | `https://webapi.oxylabs.io` | Override for staging or a proxy |
 | `OXYLABS_TIMEOUT` | `120` | Per-request timeout in seconds |
 | `OXYLABS_RETRIES` | `2` | Retries on a transient 500/502/503/504 |
@@ -192,7 +192,7 @@ docker run --rm -p 8080:8080 \
 | `OXYLABS_SPILL_DIR` | system temp | Where offloaded pages are written (stdio only) |
 | `OXYLABS_SPILL_TTL_HOURS` | `6` | Offloaded pages older than this are pruned on write |
 | `OXYLABS_SPILL` | `1` | Set to `0` to keep everything inline even on stdio |
-| `MCP_TRANSPORT` | `stdio` | `stdio` or `streamable-http` |
+| `MCP_TRANSPORT` | `stdio` | `stdio` or `http` (`streamable-http` still accepted) |
 | `HOST` / `PORT` | `127.0.0.1` / `8080` | HTTP transport bind address |
 | `MCP_ALLOWED_HOSTS` | `localhost:*,127.0.0.1:*` | Comma-separated `Host` allowlist (HTTP only) |
 | `MCP_ALLOWED_ORIGINS` | *(empty)* | Comma-separated `Origin` allowlist (browser clients) |
@@ -204,7 +204,7 @@ request time and is never written to disk or logged.
 
 - **Callers can bring their own key over HTTP.** Send `Authorization: Bearer <key>` with
   each request and the server uses it for that call, so one deployment serves several
-  callers on their own quota. `OXYLABS_API_KEY` in the server environment is the fallback
+  callers on their own quota. `OXYLABS_WEB_API_KEY` in the server environment is the fallback
   when no header arrives.
 - **Cap the spend.** `OXYLABS_RATE_LIMIT=100/1h` refuses tool calls past a sliding window,
   so a runaway agent loop cannot drain the key. Off by default.

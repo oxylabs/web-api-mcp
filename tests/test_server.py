@@ -10,7 +10,7 @@ import sys
 import httpx
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-os.environ.setdefault("OXYLABS_API_KEY", "test-key")
+os.environ.setdefault("OXYLABS_WEB_API_KEY", "test-key")
 
 import oxylabs_web_api_mcp.server as srv  # noqa: E402
 from oxylabs_web_api_mcp.server import (  # noqa: E402
@@ -140,41 +140,59 @@ def test_scrape_rejects_unknown_format():
 
 
 class _FakeCtx:
-    """Just enough Context for the bits that read headers and capabilities."""
+    """Just enough of a FastMCP Context for the bits that elicit and log."""
 
-    def __init__(self, headers=None, elicitation=None, answer=None):
-        self.headers = headers
-        self.client_capabilities = type("Caps", (), {"elicitation": elicitation})()
+    def __init__(self, elicitation=None, answer=None):
+        caps = type("Caps", (), {"elicitation": elicitation})()
+        params = type("Params", (), {"capabilities": caps})()
+        self.session = type("Session", (), {"client_params": params})()
         self._answer = answer
         self.messages = []
 
     async def info(self, message):
         self.messages.append(message)
 
-    async def elicit(self, message, schema):
+    async def elicit(self, message, response_type):
         action, proceed = self._answer
         data = type("Data", (), {"proceed": proceed})()
         return type("Result", (), {"action": action, "data": data})()
 
 
+class _headers:
+    """Stand in for the headers of an in-flight HTTP request."""
+
+    def __init__(self, headers):
+        self.headers = headers
+
+    def __enter__(self):
+        self._real = srv._http_headers
+        srv._http_headers = lambda: self.headers
+        return self
+
+    def __exit__(self, *exc):
+        srv._http_headers = self._real
+        return False
+
+
 def test_bearer_header_beats_the_environment():
-    ctx = _FakeCtx(headers={"authorization": "Bearer from-header"})
-    assert srv._api_key(ctx) == "from-header"
+    with _headers({"authorization": "Bearer from-header"}):
+        assert srv._api_key() == "from-header"
     # No usable header falls back to the environment.
-    assert srv._api_key(_FakeCtx(headers={"authorization": "Basic nope"})) == "test-key"
-    assert srv._api_key(None) == "test-key"
+    with _headers({"authorization": "Basic nope"}):
+        assert srv._api_key() == "test-key"
+    assert srv._api_key() == "test-key"
 
 
 def test_missing_key_everywhere_is_an_actionable_error():
-    saved = os.environ.pop("OXYLABS_API_KEY")
+    saved = os.environ.pop("OXYLABS_WEB_API_KEY")
     try:
-        srv._api_key(_FakeCtx())
+        srv._api_key()
     except ApiError as exc:
         assert "Authorization: Bearer" in str(exc), exc
     else:
         raise AssertionError("expected ApiError when no key is available")
     finally:
-        os.environ["OXYLABS_API_KEY"] = saved
+        os.environ["OXYLABS_WEB_API_KEY"] = saved
 
 
 def test_trim_drops_the_echo_but_keeps_the_request_id():
@@ -421,13 +439,13 @@ def test_a_cjk_page_that_fits_in_chars_is_still_offloaded():
 
 
 def test_client_can_declare_its_own_token_budget():
-    assert srv._token_budget(None) == srv.MAX_INLINE_TOKENS
-    assert srv._token_budget(_FakeCtx(headers={"x-mcp-max-tokens": "50000"})) == 50000
-    assert srv._token_budget(_FakeCtx(headers={"x-mcp-max-tokens": "0"})) is None
-    assert (
-        srv._token_budget(_FakeCtx(headers={"x-mcp-max-tokens": "nonsense"}))
-        == srv.MAX_INLINE_TOKENS
-    )
+    assert srv._token_budget() == srv.MAX_INLINE_TOKENS
+    with _headers({"x-mcp-max-tokens": "50000"}):
+        assert srv._token_budget() == 50000
+    with _headers({"x-mcp-max-tokens": "0"}):
+        assert srv._token_budget() is None
+    with _headers({"x-mcp-max-tokens": "nonsense"}):
+        assert srv._token_budget() == srv.MAX_INLINE_TOKENS
 
 
 def test_truncation_notice_says_how_to_get_the_rest():
