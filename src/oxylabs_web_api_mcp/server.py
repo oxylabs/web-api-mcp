@@ -20,6 +20,7 @@ import argparse
 import asyncio
 import hashlib
 import os
+import random
 import re
 import tempfile
 import time
@@ -36,6 +37,37 @@ from fastmcp.exceptions import ToolError
 from fastmcp.server.dependencies import get_http_headers, get_http_request
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
+
+
+def _load_env_file() -> None:
+    """Fill unset `OXYLABS_*` variables from a `.env` beside the project.
+
+    A project that keeps its key in `.env` — the shape `.env.example` tells people to
+    copy — should just work, without wrapping the launcher in a shell that sources it.
+    The real environment always wins, and only `OXYLABS_*` names are read, so an
+    unrelated `.env` cannot inject anything else into this process.
+    """
+    try:
+        text = Path(os.environ.get("OXYLABS_ENV_FILE", ".env")).read_text()
+    except OSError:
+        return
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        name, sep, value = line.removeprefix("export ").partition("=")
+        name = name.strip()
+        # An empty value counts as unset: an MCP config that interpolates ${OXYLABS_WEB_API_KEY}
+        # passes an empty string when the variable is missing, and that must not shadow the file.
+        if not sep or not name.startswith("OXYLABS_") or os.environ.get(name, "").strip():
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        os.environ[name] = value
+
+
+_load_env_file()
 
 BASE_URL = os.environ.get("OXYLABS_BASE_URL", "https://webapi.oxylabs.io").rstrip("/")
 TIMEOUT = float(os.environ.get("OXYLABS_TIMEOUT", "120"))
@@ -60,8 +92,10 @@ READ_CHUNK_CHARS = int(os.environ.get("OXYLABS_READ_CHUNK_CHARS", "40000"))
 PREVIEW_CHARS = 2000
 
 # Transient upstream failures are retried here rather than handed to the agent, which has
-# no better recovery than trying again.
-RETRY_STATUS = frozenset({500, 502, 503, 504})
+# no better recovery than trying again. 429 is in the set because a rate limit clears on
+# its own; a spent quota does not, which is why the attempt cap is low and the error the
+# agent finally sees says so.
+RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
 RETRIES = int(os.environ.get("OXYLABS_RETRIES", "2"))
 RETRY_BASE_DELAY = float(os.environ.get("OXYLABS_RETRY_BASE_DELAY", "1"))
 
@@ -293,14 +327,27 @@ def _check(resp: httpx.Response, path: str) -> dict[str, Any]:
     if resp.status_code == 401:
         raise ApiError("Authentication failed (401). Check the API key.")
     if resp.status_code == 429:
-        raise ApiError("Rate limited (429). Back off and retry with fewer concurrent requests.")
+        # Reached only once the retries above are spent: backoff did not clear it, so this
+        # is a quota problem for the human, not something to keep hammering.
+        raise ApiError(
+            "Rate limited (429) and still limited after backoff. Lower concurrency, or "
+            "check the account's remaining quota in the Oxylabs dashboard."
+        )
     if resp.status_code >= 400:
         raise ApiError(f"{path} returned {resp.status_code}: {_detail(resp)}")
     try:
-        return resp.json()
+        body = resp.json()
     except ValueError:
         # OPTIONS on an endpoint is not guaranteed to answer with JSON.
         return {"raw": resp.text[:20000]}
+    # A 2xx is not the whole story: the envelope carries its own status, and "faulted"
+    # means the work failed upstream even though the code says otherwise.
+    if isinstance(body, dict) and body.get("status") == "faulted":
+        raise ApiError(
+            f"{path} returned {resp.status_code} but the response status is \"faulted\": "
+            f"{_detail(resp)}"
+        )
+    return body
 
 
 def _parse_rate_limit(spec: str) -> tuple[int, float] | None:
@@ -367,7 +414,8 @@ async def _request(
     last_error: ApiError | None = None
     for attempt in range(RETRIES + 1):
         if attempt:
-            await asyncio.sleep(RETRY_BASE_DELAY * 2 ** (attempt - 1))
+            # Full jitter: concurrent callers that hit the same 429 must not retry in lockstep.
+            await asyncio.sleep(random.uniform(0, RETRY_BASE_DELAY * 2 ** (attempt - 1)))
             await _note(ctx, f"Retrying {path} (attempt {attempt + 1} of {RETRIES + 1})")
         try:
             async with httpx.AsyncClient(timeout=seconds) as client:

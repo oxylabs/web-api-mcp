@@ -115,9 +115,18 @@ Full API documentation: **[Oxylabs Web API docs](https://github.com/oxylabs/gitb
 ## Install
 
 ```bash
+uv tool install git+https://github.com/oxylabs/web-api-mcp
+```
+
+That puts `oxylabs-web-api-mcp` on your `PATH` in its own environment. `pipx install
+git+https://github.com/oxylabs/web-api-mcp` does the same. Installing into a system Python
+usually fails — most are marked externally managed and refuse. To work on the server
+itself:
+
+```bash
 git clone https://github.com/oxylabs/web-api-mcp.git
 cd web-api-mcp
-pip install .
+pip install -e .
 ```
 
 `server.json` is the [MCP registry](https://github.com/modelcontextprotocol/registry)
@@ -182,8 +191,8 @@ docker run --rm -p 8080:8080 \
 | `OXYLABS_WEB_API_KEY` | *(required on stdio)* | Web API key, sent as `Authorization: Bearer <key>`. Over HTTP a per-request `Authorization: Bearer` header takes precedence |
 | `OXYLABS_BASE_URL` | `https://webapi.oxylabs.io` | Override for staging or a proxy |
 | `OXYLABS_TIMEOUT` | `120` | Per-request timeout in seconds |
-| `OXYLABS_RETRIES` | `2` | Retries on a transient 500/502/503/504 |
-| `OXYLABS_RETRY_BASE_DELAY` | `1` | Seconds before the first retry, doubling after |
+| `OXYLABS_RETRIES` | `2` | Retries on a transient 429/500/502/503/504 |
+| `OXYLABS_RETRY_BASE_DELAY` | `1` | Backoff ceiling before the first retry, doubling after; the wait is jittered within it |
 | `OXYLABS_RATE_LIMIT` | *(off)* | Cap this server's own spend, e.g. `100/1h`, `50/30m` |
 | `OXYLABS_JS_TIMEOUT` | `150` | Timeout for background JavaScript-rendering jobs, matching the upstream render ceiling |
 | `OXYLABS_JOB_TTL_MINUTES` | `60` | How long a finished job's result stays pollable |
@@ -199,8 +208,12 @@ docker run --rm -p 8080:8080 \
 | `MCP_ALLOWED_HOSTS` | `localhost:*,127.0.0.1:*` | Comma-separated `Host` allowlist (HTTP only) |
 | `MCP_ALLOWED_ORIGINS` | *(empty)* | Comma-separated `Origin` allowlist (browser clients) |
 
-Copy `.env.example` to `.env` for local use. The key is read from the environment at
-request time and is never written to disk or logged.
+Copy `.env.example` to `.env` for local use. On stdio the server reads that `.env` from
+its working directory: any `OXYLABS_*` name not already set in the environment is filled
+from there, so a project that keeps its key in `.env` needs no launcher wrapper. Real environment variables always win, and
+only `OXYLABS_*` names are read. Point it elsewhere with `OXYLABS_ENV_FILE=/path/to/.env`.
+
+The key is read at request time and is never written to disk or logged.
 
 ## Security notes
 

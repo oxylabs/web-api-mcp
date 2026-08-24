@@ -196,12 +196,15 @@ curl -sS https://webapi.oxylabs.io/v1/search \
 
 | Field | Type | Notes |
 |---|---|---|
-| `query` | string, **required** | Non-empty. Write it like a search query, not a sentence. |
+| `query` | string, **required** | 1–2048 characters. Write it like a search query, not a sentence. |
 | `max_results` | integer, 1–20 | Default 10. |
-| `location` | string | Geo context, e.g. `"Germany"`, `"New York,New York,United States"`. |
+| `location` | string | Geo context, max 256 chars, e.g. `"Germany"`, `"New York,New York,United States"`. |
 
 Returns `results[]` with `title`, `shortDescription`, `url`, `metadata.position`, plus
-`related_searches[]` and `related_questions[]`.
+`related_searches[]` (`query`, `link`) and `related_questions[]` (`question`, plus nullable
+`title`, `link`, `snippet`). None of the three arrays is guaranteed present — absent means
+the same as empty, so read them as "array or `[]`". `status` is `done` or `faulted`; check
+it, because `faulted` can arrive with a `2xx`.
 
 **Descriptions are search snippets, not page content.** Never answer a factual question
 from `shortDescription` alone — it is truncated and often stale. Scrape the source.
@@ -279,8 +282,8 @@ want most of the time.
 |---|---|---|
 | 400 | Validation failed | Read `extra[].key` and `extra[].message`; fix that field. Do not retry unchanged. |
 | 401 | Bad or missing key | Stop and tell the user. Retrying will not help. |
-| 429 | Rate limited | Back off exponentially, reduce concurrency. |
-| 5xx | Upstream trouble | Retry up to 3 times with backoff, then report. |
+| 429 | Rate limit **or** spent quota — not distinguishable | The MCP tools already retried with jittered backoff. If you still see it, stop retrying and tell the user to check their quota. |
+| 5xx | Upstream trouble | Already retried for you. Report it rather than re-sending. |
 
 A 400 is a bug in your request. Fix the field the response names instead of retrying.
 

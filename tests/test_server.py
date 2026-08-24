@@ -11,7 +11,7 @@ import time
 import httpx
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-os.environ.setdefault("OXYLABS_WEB_API_KEY", "test-key")
+os.environ["OXYLABS_WEB_API_KEY"] = "test-key"
 
 import oxylabs_web_api_mcp.server as srv  # noqa: E402
 from oxylabs_web_api_mcp.server import (  # noqa: E402
@@ -606,6 +606,143 @@ def test_the_skill_ships_inside_the_package():
     text = srv._skill_text()
     assert not text.startswith("---"), "frontmatter is for a skill loader, not a resource"
     assert "search" in text and "run_js" in text, text[:200]
+
+
+def _stub_client(responder):
+    """Swap httpx.AsyncClient for one that answers from `responder(method, url)`."""
+
+    class _Client:
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def request(self, method, url, json=None, headers=None):
+            return responder(method, url)
+
+    return _Client
+
+
+def test_a_429_is_retried_and_then_reported_as_a_quota_problem():
+    calls = []
+
+    def cleared(method, url):
+        calls.append(url)
+        status = 429 if len(calls) < 3 else 200
+        return httpx.Response(
+            status,
+            json={"results": []} if status == 200 else {"message": "slow down"},
+            request=httpx.Request(method, url),
+        )
+
+    real_client, real_delay = httpx.AsyncClient, srv.RETRY_BASE_DELAY
+    httpx.AsyncClient, srv.RETRY_BASE_DELAY = _stub_client(cleared), 0
+    try:
+        assert asyncio.run(srv._request("POST", "/v1/search", {"query": "x"})) == {"results": []}
+        assert len(calls) == 3, "a rate limit clears on its own; it is worth retrying"
+
+        stuck = _stub_client(
+            lambda m, u: httpx.Response(429, json={"message": "no"}, request=httpx.Request(m, u))
+        )
+        httpx.AsyncClient = stuck
+        try:
+            asyncio.run(srv._request("POST", "/v1/search", {"query": "x"}))
+        except ApiError as exc:
+            # Backoff cannot clear a spent quota, so the message has to send the human
+            # to the dashboard rather than inviting another round of retries.
+            assert "quota" in str(exc).lower(), exc
+        else:
+            raise AssertionError("expected ApiError once the retries are spent")
+    finally:
+        httpx.AsyncClient, srv.RETRY_BASE_DELAY = real_client, real_delay
+
+
+def test_backoff_is_jittered_so_callers_do_not_retry_in_lockstep():
+    windows = []
+
+    def _record(low, high):
+        windows.append((low, high))
+        return 0
+
+    stub = _stub_client(
+        lambda m, u: httpx.Response(503, json={"message": "down"}, request=httpx.Request(m, u))
+    )
+    real_client, real_uniform = httpx.AsyncClient, srv.random.uniform
+    httpx.AsyncClient, srv.random.uniform = stub, _record
+    try:
+        try:
+            asyncio.run(srv._request("POST", "/v1/search", {"query": "x"}))
+        except ApiError:
+            pass
+        assert windows, "a retry must sleep a random amount, not a fixed one"
+        assert all(low == 0 for low, _ in windows), windows
+        highs = [high for _, high in windows]
+        assert highs == sorted(highs) and highs[-1] > highs[0], highs
+    finally:
+        httpx.AsyncClient, srv.random.uniform = real_client, real_uniform
+
+
+def test_a_2xx_carrying_faulted_is_not_treated_as_success():
+    stub = _stub_client(
+        lambda m, u: httpx.Response(
+            200,
+            json={"status": "faulted", "message": "upstream gave up"},
+            request=httpx.Request(m, u),
+        )
+    )
+    real_client = httpx.AsyncClient
+    httpx.AsyncClient = stub
+    try:
+        asyncio.run(srv._request("POST", "/v1/search", {"query": "x"}))
+    except ApiError as exc:
+        assert "faulted" in str(exc), exc
+    else:
+        raise AssertionError("a 2xx with status=faulted is a failure, not a result")
+    finally:
+        httpx.AsyncClient = real_client
+
+
+def test_env_file_fills_unset_oxylabs_vars_and_nothing_else():
+    import tempfile as _tempfile
+
+    with _tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, ".env")
+        with open(path, "w") as fh:
+            fh.write(
+                "# a comment\n"
+                "\n"
+                'export OXYLABS_WEB_API_KEY="from-file"\n'
+                "OXYLABS_TIMEOUT=7\n"
+                "PATH=/definitely/not\n"
+            )
+
+        saved_path, saved_timeout = os.environ["PATH"], os.environ.pop("OXYLABS_TIMEOUT", None)
+        os.environ["OXYLABS_ENV_FILE"] = path
+        try:
+            srv._load_env_file()
+            # The real environment wins: the key is already set, so the file must not win.
+            assert os.environ["OXYLABS_WEB_API_KEY"] == "test-key"
+            assert os.environ["OXYLABS_TIMEOUT"] == "7"
+            assert os.environ["PATH"] == saved_path, "only OXYLABS_* may come from a .env"
+
+            # An MCP config interpolating ${OXYLABS_WEB_API_KEY} passes "" when it is
+            # unset; that must not shadow the file.
+            saved_key = os.environ["OXYLABS_WEB_API_KEY"]
+            os.environ["OXYLABS_WEB_API_KEY"] = ""
+            try:
+                srv._load_env_file()
+                assert os.environ["OXYLABS_WEB_API_KEY"] == "from-file"
+            finally:
+                os.environ["OXYLABS_WEB_API_KEY"] = saved_key
+        finally:
+            os.environ.pop("OXYLABS_ENV_FILE", None)
+            os.environ.pop("OXYLABS_TIMEOUT", None)
+            if saved_timeout is not None:
+                os.environ["OXYLABS_TIMEOUT"] = saved_timeout
 
 
 if __name__ == "__main__":
