@@ -276,12 +276,15 @@ def _detail(resp: httpx.Response) -> str:
     except ValueError:
         return resp.text[:500]
     if isinstance(body, dict):
-        # Validation errors carry `extra`; gateway errors carry `message`.
+        # Validation errors carry `extra`; gateway errors carry `message`. `extra` is
+        # typed object|array|null upstream, so a list is the common case, not the only one.
         problems = body.get("extra")
-        if problems:
+        if isinstance(problems, list) and problems:
             return "; ".join(
                 f"{p.get('key')}: {p.get('message')}" for p in problems if isinstance(p, dict)
             )
+        if isinstance(problems, dict) and problems:
+            return str(problems)[:500]
         return str(body.get("detail") or body.get("message") or body)[:500]
     return str(body)[:500]
 
@@ -651,6 +654,8 @@ async def search(
                 "beat sentence-shaped ones. One question per search."
             ),
             examples=["eu ai act compliance deadlines", "figma pricing per seat"],
+            min_length=1,
+            max_length=2048,
         ),
     ],
     max_results: Annotated[
@@ -665,6 +670,7 @@ async def search(
                 "validated upstream and silently falls back to the default geo."
             ),
             examples=["Germany", "New York,New York,United States"],
+            max_length=256,
         ),
     ] = None,
     ctx: Context | None = None,
@@ -676,6 +682,10 @@ async def search(
     """
     if not query.strip():
         raise ApiError("`query` must not be empty.")
+    if len(query) > 2048:
+        raise ApiError("`query` must be 2048 characters or fewer.")
+    if location and len(location) > 256:
+        raise ApiError("`location` must be 256 characters or fewer.")
     if not 1 <= max_results <= 20:
         raise ApiError("`max_results` must be an integer between 1 and 20.")
 
