@@ -6,6 +6,7 @@ Run: python tests/test_server.py   (or: pytest)
 import asyncio
 import os
 import sys
+import time
 
 import httpx
 
@@ -278,6 +279,38 @@ def test_check_scrape_reports_a_failed_job_instead_of_hanging():
             raise AssertionError("a failed job must surface as an error, not a result")
     finally:
         srv._request = real
+
+
+def test_a_slow_render_is_not_reported_as_a_stuck_one():
+    """A job inside the 150s window must read as normal, past it as still-worth-polling.
+
+    The failure this guards is an agent abandoning a healthy render and starting over,
+    which doubles the bill and the wait.
+    """
+
+    def _running(age):
+        return {
+            "status": "running",
+            "created": time.time() - age,
+            "url": "https://ex.com",
+            "result": None,
+            "error": None,
+        }
+
+    srv._JOBS["slow"] = _running(90)
+    srv._JOBS["late"] = _running(srv.JS_RENDER_MAX_SECONDS + 60)
+    try:
+        slow = asyncio.run(check_scrape("slow"))
+        assert slow["elapsed_seconds"] >= 90, slow
+        assert "normal" in slow["note"] and str(srv.JS_RENDER_MAX_SECONDS) in slow["note"], slow
+
+        late = asyncio.run(check_scrape("late"))
+        assert f"past the {srv.JS_RENDER_MAX_SECONDS}s" in late["note"], late
+        # Past the ceiling it still says to poll, not to restart: the server waits longer.
+        assert "poll again" in late["note"], late
+    finally:
+        srv._JOBS.pop("slow", None)
+        srv._JOBS.pop("late", None)
 
 
 def test_check_scrape_rejects_an_unknown_job():

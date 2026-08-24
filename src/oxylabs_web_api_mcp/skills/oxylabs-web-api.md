@@ -37,7 +37,7 @@ more, or both:
 | Find pages on a topic | `search` | No URL yet. One question per search |
 | Read a page you have a URL for | `scrape` | The default. Markdown, one fetch |
 | Read a page that came back empty | `scrape` + `run_js=True` | Only after a plain scrape returned `content_thin` |
-| Collect a render job | `check_scrape` | After a `run_js` call, ~30s later |
+| Collect a render job | `check_scrape` | After a `run_js` call, ~30s later, then every ~10s to 150s |
 | Walk a page too big to return | `read_scraped` | The result carried `content_offloaded` |
 | Named fields, not a page to read | `extract` | You need the same fields off several pages. Billed above a scrape, and the user approves each run |
 | A target-specific scraper | `list_scrapers` then `scrape_target` | The generic scraper does not carry the parameter you need |
@@ -120,15 +120,17 @@ Every parameter carries the meaning it has in the HTTP tables below — `locatio
 
 ### JavaScript rendering comes back as a job
 
-`run_js` pages take at least 30 seconds, so the tool returns a job id instead of content:
+`run_js` pages take 30-150 seconds, so the tool returns a job id instead of content:
 
 ```jsonc
 { "job_id": "9f3c1a20b7d4", "status": "running", "url": "https://example.com" }
 ```
 
-Wait ~30 seconds, call `check_scrape(job_id)`, and keep polling every ~15 seconds while it
-says `running`. **Do other work between polls** — scrape another source, draft the parts of
-the answer you already have. Idling on the poll is the whole cost of this being async.
+Wait ~30 seconds, call `check_scrape(job_id)`, and keep polling every ~10 seconds while it
+says `running`. A render can take the full 150 seconds, so a job still running on the third
+poll is normal — do not abandon it and start over, which doubles the cost and the wait.
+**Do other work between polls** — scrape another source, draft the parts of the answer you
+already have. Idling on the poll is the whole cost of this being async.
 
 Only reach for `run_js` when a plain `scrape` came back empty or skeletal. Most pages do
 not need it, and it is slower and heavier for the ones that don't.

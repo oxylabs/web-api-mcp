@@ -41,8 +41,15 @@ BASE_URL = os.environ.get("OXYLABS_BASE_URL", "https://webapi.oxylabs.io").rstri
 TIMEOUT = float(os.environ.get("OXYLABS_TIMEOUT", "120"))
 
 # JavaScript rendering routinely runs past a normal request timeout, so those calls are
-# run as background jobs with a timeout of their own.
-JS_TIMEOUT = float(os.environ.get("OXYLABS_JS_TIMEOUT", "300"))
+# run as background jobs with a timeout of their own. It matches the upstream ceiling
+# below: a render that has not landed by then is not going to.
+JS_TIMEOUT = float(os.environ.get("OXYLABS_JS_TIMEOUT", "150"))
+
+# What a render actually costs upstream: 30s at the fast end, 150s at the slow end. Not a
+# knob — it is a property of the API, and it is only ever quoted to the agent so it knows
+# how long to keep polling before treating a job as stuck.
+JS_RENDER_MIN_SECONDS = 30
+JS_RENDER_MAX_SECONDS = 150
 JOB_TTL_SECONDS = float(os.environ.get("OXYLABS_JOB_TTL_MINUTES", "60")) * 60
 
 # Content bigger than this is offloaded to disk (local) or truncated (remote). Measured in
@@ -538,7 +545,7 @@ def _flag_thin_content(payload: dict[str, Any]) -> dict[str, Any]:
             "note": (
                 "This page returned no readable content, which usually means it renders "
                 "client-side. Retry the same call with run_js=True — that returns a job "
-                "id to poll with `check_scrape`, and takes ~30s or more. If the page is "
+                "id to poll with `check_scrape`, and takes 30-150s. If the page is "
                 "genuinely this short, take it at face value: do not retry twice, and do "
                 "not fall back to your own recollection of what the page says."
             ),
@@ -571,7 +578,7 @@ def _trim(payload: dict[str, Any]) -> dict[str, Any]:
 # — and would delete this section along with `check_scrape`. It is not a swap-in yet:
 # it needs the `fastmcp[tasks]` extra (10 more packages, including redis and cloudpickle),
 # and its "optional" mode still runs synchronously for any client that does not ask for a
-# task, which is every client we ship to today. A synchronous JS render is the 300-second
+# task, which is every client we ship to today. A synchronous JS render is the 150-second
 # tool call this dict exists to avoid, so the dict would have to stay as the fallback
 # either way. Revisit when the target clients request tasks themselves.
 _JOBS: dict[str, dict[str, Any]] = {}
@@ -620,10 +627,13 @@ def _submit_job(
         "status": "running",
         "url": payload.get("url", ""),
         "note": (
-            "JavaScript rendering takes at least 30 seconds. Wait ~30s, then call "
-            f"check_scrape('{job_id}') and keep polling every ~15s while it says running. "
-            f"The result is kept for {JOB_TTL_SECONDS / 60:.0f} minutes. Get on with other "
-            "work in the meantime rather than idling on the poll."
+            f"JavaScript rendering takes {JS_RENDER_MIN_SECONDS}-{JS_RENDER_MAX_SECONDS}s. "
+            f"Wait ~{JS_RENDER_MIN_SECONDS}s, then call check_scrape('{job_id}') and poll "
+            f"every ~10s while it says running. Do not start over before "
+            f"{JS_RENDER_MAX_SECONDS}s have passed — a slow render is normal, and a second "
+            f"attempt doubles the cost and the wait. The result is kept for "
+            f"{JOB_TTL_SECONDS / 60:.0f} minutes. Get on with other work in the meantime "
+            "rather than idling on the poll."
         ),
     }
 
@@ -835,8 +845,9 @@ async def check_scrape(
 ) -> dict[str, Any]:
     """Check a JavaScript-rendering job started by `scrape` or `extract`.
 
-    While it says running, poll again in ~15 seconds rather than immediately — and do
-    other work between polls. The finished result is returned in full, once it is ready.
+    While it says running, poll again in ~10 seconds — and do other work between polls.
+    A render runs 30-150s, so a dozen polls are normal and a job still running at 100s is
+    not stuck. The finished result is returned in full.
     """
     record = _JOBS.get(job_id)
     if record is None:
@@ -852,7 +863,14 @@ async def check_scrape(
             "status": "running",
             "url": record["url"],
             "elapsed_seconds": elapsed,
-            "note": "Not finished. Poll again in ~15s.",
+            "note": (
+                f"Not finished after {elapsed}s. Renders take up to "
+                f"{JS_RENDER_MAX_SECONDS}s, so this is normal — poll again in ~10s."
+                if elapsed < JS_RENDER_MAX_SECONDS
+                else f"Not finished after {elapsed}s, past the {JS_RENDER_MAX_SECONDS}s a "
+                f"render should take. The request times out at {JS_TIMEOUT:.0f}s, so poll "
+                "again in ~10s: it will come back with the page or with an error shortly."
+            ),
         }
     if record["status"] == "error":
         raise ApiError(f"Job {job_id} failed after {elapsed}s: {record['error']}")
