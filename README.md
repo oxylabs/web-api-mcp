@@ -44,7 +44,7 @@ that knows its own limit can override it per request with an `X-MCP-Max-Tokens` 
 
 ## JavaScript rendering is a job, not a wait
 
-`run_js` pages take at least 30 seconds and routinely outlive a tool call. So `scrape(url,
+`run_js` pages take 30-150 seconds and routinely outlive a tool call. So `scrape(url,
 run_js=True)` (and `extract`, and `scrape_target` with `run_js` in its params) returns a job
 id straight away:
 
@@ -52,8 +52,10 @@ id straight away:
 { "job_id": "9f3c1a20b7d4", "status": "running", "url": "https://example.com" }
 ```
 
-The agent polls `check_scrape(job_id)` — after ~30s, then every ~15s — and does other work
-in between. Results are kept for `OXYLABS_JOB_TTL_MINUTES` (default 60).
+The agent polls `check_scrape(job_id)` — after ~30s, then every ~30s — and does other work
+in between. Each reply carries `elapsed_seconds` and says whether the job is still inside
+the normal 150s window, so a slow render doesn't read as a stuck one. Results are kept for
+`OXYLABS_JOB_TTL_MINUTES` (default 60), long after the job itself has finished.
 
 ### It says when a page needed rendering
 
