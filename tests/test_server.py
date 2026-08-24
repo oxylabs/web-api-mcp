@@ -305,7 +305,7 @@ def test_a_slow_render_is_not_reported_as_a_stuck_one():
         assert "normal" in slow["note"] and str(srv.JS_RENDER_MAX_SECONDS) in slow["note"], slow
 
         late = asyncio.run(check_scrape("late"))
-        assert "past the usual" in late["note"], late
+        assert f"past the {srv.JS_RENDER_MAX_SECONDS}s" in late["note"], late
         # Past the ceiling it still says to poll, not to restart: the server waits longer.
         assert "poll again" in late["note"], late
     finally:

@@ -52,7 +52,7 @@ id straight away:
 { "job_id": "9f3c1a20b7d4", "status": "running", "url": "https://example.com" }
 ```
 
-The agent polls `check_scrape(job_id)` — after ~30s, then every ~30s — and does other work
+The agent polls `check_scrape(job_id)` — after ~30s, then every ~10s — and does other work
 in between. Each reply carries `elapsed_seconds` and says whether the job is still inside
 the normal 150s window, so a slow render doesn't read as a stuck one. Results are kept for
 `OXYLABS_JOB_TTL_MINUTES` (default 60), long after the job itself has finished.
@@ -185,7 +185,7 @@ docker run --rm -p 8080:8080 \
 | `OXYLABS_RETRIES` | `2` | Retries on a transient 500/502/503/504 |
 | `OXYLABS_RETRY_BASE_DELAY` | `1` | Seconds before the first retry, doubling after |
 | `OXYLABS_RATE_LIMIT` | *(off)* | Cap this server's own spend, e.g. `100/1h`, `50/30m` |
-| `OXYLABS_JS_TIMEOUT` | `300` | Timeout for background JavaScript-rendering jobs |
+| `OXYLABS_JS_TIMEOUT` | `150` | Timeout for background JavaScript-rendering jobs, matching the upstream render ceiling |
 | `OXYLABS_JOB_TTL_MINUTES` | `60` | How long a finished job's result stays pollable |
 | `OXYLABS_THIN_CONTENT_CHARS` | `500` | Below this much visible text, a page is flagged `content_thin` |
 | `OXYLABS_EXTRACT_APPROVAL` | `1` | Set to `0` to skip the user prompt on `extract` |
