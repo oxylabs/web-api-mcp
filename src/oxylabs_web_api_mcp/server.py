@@ -345,7 +345,7 @@ def _check(resp: httpx.Response, path: str) -> dict[str, Any]:
     # means the work failed upstream even though the code says otherwise.
     if isinstance(body, dict) and body.get("status") == "faulted":
         raise ApiError(
-            f"{path} returned {resp.status_code} but the response status is \"faulted\": "
+            f'{path} returned {resp.status_code} but the response status is "faulted": '
             f"{_detail(resp)}"
         )
     return body
