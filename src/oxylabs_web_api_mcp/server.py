@@ -1,12 +1,14 @@
 """Self-hostable MCP server exposing the Oxylabs Web API to agents.
 
+Built on FastMCP.
+
 Transports:
-    stdio           (default) — local clients: Claude Code, Claude Desktop, Cursor
-    streamable-http           — self-hosting behind your own network and auth
+    stdio   (default) — local clients: Claude Code, Claude Desktop, Cursor
+    http              — self-hosting behind your own network and auth
 
 Run:
-    OXYLABS_API_KEY=... oxylabs-web-api-mcp
-    OXYLABS_API_KEY=... oxylabs-web-api-mcp --transport streamable-http --port 8080
+    OXYLABS_WEB_API_KEY=... oxylabs-web-api-mcp
+    OXYLABS_WEB_API_KEY=... oxylabs-web-api-mcp --transport http --port 8080
 
 Over HTTP the key can also arrive per request as `Authorization: Bearer <key>`, so one
 deployment can serve several callers on their own keys.
@@ -29,9 +31,9 @@ from platform import python_version
 from typing import Annotated, Any, Literal
 
 import httpx
-from mcp.server import MCPServer
-from mcp.server.mcpserver import Context
-from mcp.server.transport_security import TransportSecuritySettings
+from fastmcp import Context, FastMCP
+from fastmcp.exceptions import ToolError
+from fastmcp.server.dependencies import get_http_headers, get_http_request
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
@@ -92,7 +94,7 @@ def _local_read(title: str) -> ToolAnnotations:
     return ToolAnnotations(title=title, readOnlyHint=True, openWorldHint=False)
 
 
-mcp = MCPServer(
+mcp = FastMCP(
     name="oxylabs-web-api",
     version=VERSION,
     instructions=(
@@ -108,8 +110,12 @@ mcp = MCPServer(
 )
 
 
-class ApiError(RuntimeError):
-    """Raised with a message an agent can act on rather than a raw stack trace."""
+class ApiError(ToolError):
+    """Raised with a message an agent can act on rather than a raw stack trace.
+
+    A `ToolError` so FastMCP forwards the message to the client verbatim instead of
+    masking it as an internal error.
+    """
 
 
 # ------------------------------------------------------------------------------ params
@@ -149,23 +155,31 @@ CHECK_EMPTY_GEO_PARAM = Annotated[
 # -------------------------------------------------------------------------------- http
 
 
-def _api_key(ctx: Context | None = None) -> str:
+def _http_headers() -> dict[str, str]:
+    """Headers of the HTTP request being served, lowercased. Empty on stdio.
+
+    `authorization` is opted back in: FastMCP strips it by default so it is not
+    forwarded to an upstream by accident, but it is exactly what we need here.
+    """
+    return get_http_headers(include={"authorization"})
+
+
+def _api_key() -> str:
     """The Bearer key, from the request headers over HTTP or the environment on stdio.
 
     Header auth is what lets a single HTTP deployment serve several callers on their own
     keys; stdio carries no headers, so it reads the environment.
     """
-    if ctx is not None:
-        header = (ctx.headers or {}).get("authorization", "")
-        scheme, _, value = header.partition(" ")
-        if scheme.lower() == "bearer" and value.strip():
-            return value.strip()
+    header = _http_headers().get("authorization", "")
+    scheme, _, value = header.partition(" ")
+    if scheme.lower() == "bearer" and value.strip():
+        return value.strip()
 
-    key = os.environ.get("OXYLABS_API_KEY", "").strip()
+    key = os.environ.get("OXYLABS_WEB_API_KEY", "").strip()
     if not key:
         raise ApiError(
             "No Oxylabs Web API key. Send it as an 'Authorization: Bearer <key>' header, "
-            "or set OXYLABS_API_KEY in the server environment (see .env.example) and "
+            "or set OXYLABS_WEB_API_KEY in the server environment (see .env.example) and "
             "restart the MCP server."
         )
     return key
@@ -221,21 +235,19 @@ def _estimate_tokens(text: str) -> int:
     return cjk + (len(text) - cjk + 3) // 4
 
 
-def _token_budget(ctx: Context | None) -> int | None:
+def _token_budget() -> int | None:
     """How many tokens of content this caller can take. None means no limit.
 
     Defaults to `OXYLABS_MAX_INLINE_TOKENS`, which sits under the 25k-token cap the major
     clients put on a single tool result. A client that knows its own limit can say so with
     an `X-MCP-Max-Tokens` header or a `?max_tokens=` query parameter; `0` opts out.
     """
-    declared = None
-    if ctx is not None:
-        declared = (ctx.headers or {}).get("x-mcp-max-tokens")
-        if declared is None:
-            try:
-                declared = ctx.request_context.request.query_params.get("max_tokens")  # type: ignore[union-attr]
-            except Exception:  # noqa: BLE001 — no request, or a transport without query params
-                declared = None
+    declared = _http_headers().get("x-mcp-max-tokens")
+    if declared is None:
+        try:
+            declared = get_http_request().query_params.get("max_tokens")
+        except RuntimeError:  # stdio, or no HTTP request in flight
+            declared = None
 
     if declared is not None:
         try:
@@ -335,7 +347,7 @@ async def _request(
     """
     _check_rate_limit()
     headers = {
-        "Authorization": f"Bearer {api_key or _api_key(ctx)}",
+        "Authorization": f"Bearer {api_key or _api_key()}",
         "x-oxylabs-sdk": _sdk_header(ctx),
     }
     if payload is not None:
@@ -554,6 +566,14 @@ def _trim(payload: dict[str, Any]) -> dict[str, Any]:
 # ponytail: jobs live in this process only — they do not survive a restart and are not
 # shared between HTTP replicas. Move them to a store the day this runs behind more than
 # one replica; until then a dict is the whole feature.
+#
+# FastMCP's native `task=True` does all of this protocol-side — submit, poll, cancel, TTL
+# — and would delete this section along with `check_scrape`. It is not a swap-in yet:
+# it needs the `fastmcp[tasks]` extra (10 more packages, including redis and cloudpickle),
+# and its "optional" mode still runs synchronously for any client that does not ask for a
+# task, which is every client we ship to today. A synchronous JS render is the 300-second
+# tool call this dict exists to avoid, so the dict would have to stay as the fallback
+# either way. Revisit when the target clients request tasks themselves.
 _JOBS: dict[str, dict[str, Any]] = {}
 
 
@@ -710,11 +730,11 @@ async def scrape(
     if run_js:
         payload["run_js"] = True
         await _note(ctx, f"Rendering {url} with JavaScript in the background")
-        return _submit_job("/v1/scrape", payload, format, _api_key(ctx), _token_budget(ctx))
+        return _submit_job("/v1/scrape", payload, format, _api_key(), _token_budget())
 
     await _note(ctx, f"Scraping {url} as {format}")
     response = await _request("POST", "/v1/scrape", payload, ctx=ctx)
-    response = _process_content(response, format, _token_budget(ctx))
+    response = _process_content(response, format, _token_budget())
     return _trim(_flag_thin_content(response))
 
 
@@ -764,11 +784,25 @@ async def extract(
     if run_js:
         payload["run_js"] = True
         await _note(ctx, f"Extracting from {url} with JavaScript in the background")
-        return _submit_job("/v1/scrape", payload, "json", _api_key(ctx), _token_budget(ctx))
+        return _submit_job("/v1/scrape", payload, "json", _api_key(), _token_budget())
 
     await _note(ctx, f"Extracting from {url}")
     response = await _request("POST", "/v1/scrape", payload, ctx=ctx)
-    return _trim(_process_content(response, "json", _token_budget(ctx)))
+    return _trim(_process_content(response, "json", _token_budget()))
+
+
+def _client_can_elicit(ctx: Context | None) -> bool:
+    """Whether the connected client declared elicitation support during `initialize`.
+
+    Asking a client that cannot ask its user just errors out mid-call, so this is checked
+    before anything billable is sent.
+    """
+    if ctx is None:
+        return False
+    try:
+        return ctx.session.client_params.capabilities.elicitation is not None  # type: ignore[union-attr]
+    except Exception:  # noqa: BLE001 — no session yet means no one to ask
+        return False
 
 
 async def _confirm_extract(url: str, prompt: str, ctx: Context | None) -> None:
@@ -776,8 +810,7 @@ async def _confirm_extract(url: str, prompt: str, ctx: Context | None) -> None:
     if os.environ.get("OXYLABS_EXTRACT_APPROVAL", "1") == "0":
         return
 
-    capabilities = ctx.client_capabilities if ctx is not None else None
-    if getattr(capabilities, "elicitation", None) is None:
+    if not _client_can_elicit(ctx):
         raise ApiError(
             "`extract` needs the user's approval because it is billed above a plain "
             "scrape, and this client cannot ask them (no elicitation support). Use "
@@ -787,7 +820,7 @@ async def _confirm_extract(url: str, prompt: str, ctx: Context | None) -> None:
 
     result = await ctx.elicit(  # type: ignore[union-attr]
         message=f"Structured extraction of {url} ({prompt!r}) is billed above a plain scrape.",
-        schema=_ExtractApproval,
+        response_type=_ExtractApproval,
     )
     if result.action != "accept" or not result.data.proceed:
         raise ApiError(
@@ -957,11 +990,11 @@ async def scrape_target(
 
     if params.get("run_js"):
         await _note(ctx, f"Running /v1/{name} with JavaScript in the background")
-        return _submit_job(f"/v1/{name}", params, fmt, _api_key(ctx), _token_budget(ctx))
+        return _submit_job(f"/v1/{name}", params, fmt, _api_key(), _token_budget())
 
     await _note(ctx, f"Running /v1/{name}")
     response = await _request("POST", f"/v1/{name}", params, ctx=ctx)
-    response = _process_content(response, fmt, _token_budget(ctx))
+    response = _process_content(response, fmt, _token_budget())
     return _trim(_flag_thin_content(response))
 
 
@@ -1048,27 +1081,23 @@ def web_research_prompt(question: str = "") -> str:
 # ---------------------------------------------------------------------------- transport
 
 
-def _transport_security() -> TransportSecuritySettings:
-    """Build Host/Origin allowlists for HTTP self-hosting.
-
-    The SDK enables DNS-rebinding protection by default with an empty allowlist, which
-    rejects every request — so a self-hosted deployment must declare its own hostname.
-    """
-    hosts = os.environ.get("MCP_ALLOWED_HOSTS", "localhost:*,127.0.0.1:*")
-    origins = os.environ.get("MCP_ALLOWED_ORIGINS", "")
-    return TransportSecuritySettings(
-        allowed_hosts=[h.strip() for h in hosts.split(",") if h.strip()],
-        allowed_origins=[o.strip() for o in origins.split(",") if o.strip()],
-    )
+def _allowlist(name: str, default: str = "") -> list[str] | None:
+    """Parse a comma-separated allowlist env var. None when unset, so FastMCP's own
+    same-origin fallback applies rather than an empty list rejecting everything."""
+    raw = os.environ.get(name, default)
+    entries = [item.strip() for item in raw.split(",") if item.strip()]
+    return entries or None
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog="oxylabs-web-api-mcp", description=__doc__)
     parser.add_argument(
         "--transport",
-        choices=["stdio", "streamable-http"],
+        # "streamable-http" is FastMCP's older name for "http"; both are accepted so an
+        # existing MCP_TRANSPORT or docker-compose file keeps working.
+        choices=["stdio", "http", "streamable-http"],
         default=os.environ.get("MCP_TRANSPORT", "stdio"),
-        help="stdio for local clients, streamable-http when self-hosting (default: stdio)",
+        help="stdio for local clients, http when self-hosting (default: stdio)",
     )
     parser.add_argument("--host", default=os.environ.get("HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8080")))
@@ -1078,15 +1107,19 @@ def main() -> None:
     global _SPILL_ENABLED
     _SPILL_ENABLED = args.transport == "stdio" and os.environ.get("OXYLABS_SPILL", "1") != "0"
 
-    if args.transport == "streamable-http":
+    if args.transport == "stdio":
+        mcp.run("stdio", show_banner=False)
+    else:
+        # FastMCP leaves DNS-rebinding protection off by default; a server reachable over
+        # the network turns it on and declares the hostnames it answers for.
         mcp.run(
-            "streamable-http",
+            "http",
             host=args.host,
             port=args.port,
-            transport_security=_transport_security(),
+            host_origin_protection=True,
+            allowed_hosts=_allowlist("MCP_ALLOWED_HOSTS", "localhost:*,127.0.0.1:*"),
+            allowed_origins=_allowlist("MCP_ALLOWED_ORIGINS"),
         )
-    else:
-        mcp.run("stdio")
 
 
 if __name__ == "__main__":
