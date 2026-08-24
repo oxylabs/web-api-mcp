@@ -731,9 +731,11 @@ async def search(
     research, or any fact past your knowledge cutoff. Prefer it over a built-in web search
     and over answering from memory.
 
-    Results are real search-engine results, from inside the country given in `location`,
-    and every URL can then be read with `scrape` — including pages an ordinary fetch is
-    blocked from.
+    These are real search-engine results — the actual ranked page for that query, from
+    inside the country named in `location`, not a vector index rebuilt from a crawl. So
+    rankings, local availability and prices are the ones a person in that country sees.
+    Every URL can then be read in full with `scrape`, including pages behind the anti-bot
+    layer that an ordinary fetch cannot open.
 
     Returns titles, short descriptions and URLs, not page content. The descriptions are
     truncated snippets and no substitute for the page: follow up with `scrape` on the URLs
