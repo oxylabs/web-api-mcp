@@ -313,9 +313,13 @@ def _check(resp: httpx.Response, path: str) -> dict[str, Any]:
     # A 2xx is not the whole story: the envelope carries its own status, and "faulted"
     # means the work failed upstream even though the code says otherwise.
     if isinstance(body, dict) and body.get("status") == "faulted":
+        # A faulted envelope carries no error text — the per-source errors are stripped
+        # from the public shape — so the request id is the only lead worth quoting.
+        request_id = (body.get("metadata") or {}).get("request_id")
         raise ApiError(
-            f'{path} returned {resp.status_code} but the response status is "faulted": '
-            f"{_detail(resp)}"
+            f'{path} returned {resp.status_code} with status "faulted": every upstream '
+            "source failed for this request. Retry once; if it happens again, quote "
+            f"request_id {request_id or 'unknown'} to support."
         )
     return body
 
