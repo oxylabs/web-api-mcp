@@ -34,7 +34,7 @@ from typing import Annotated, Any, Literal
 import httpx
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
-from fastmcp.server.dependencies import get_http_headers, get_http_request
+from fastmcp.server.dependencies import get_http_headers
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
@@ -72,51 +72,33 @@ _load_env_file()
 BASE_URL = os.environ.get("OXYLABS_BASE_URL", "https://webapi.oxylabs.io").rstrip("/")
 TIMEOUT = float(os.environ.get("OXYLABS_TIMEOUT", "120"))
 
-# JavaScript rendering routinely runs past a normal request timeout, so those calls are
-# run as background jobs with a timeout of their own. It matches the upstream ceiling
-# below: a render that has not landed by then is not going to.
-JS_TIMEOUT = float(os.environ.get("OXYLABS_JS_TIMEOUT", "150"))
-
-# What a render actually costs upstream: 30s at the fast end, 150s at the slow end. Not a
-# knob — it is a property of the API, and it is only ever quoted to the agent so it knows
-# how long to keep polling before treating a job as stuck.
+# Upstream JS render ceiling; jobs run in the background with their own timeout.
 JS_RENDER_MIN_SECONDS = 30
 JS_RENDER_MAX_SECONDS = 150
+JS_TIMEOUT = float(JS_RENDER_MAX_SECONDS)
 JOB_TTL_SECONDS = float(os.environ.get("OXYLABS_JOB_TTL_MINUTES", "60")) * 60
 
-# Content bigger than this is offloaded to disk (local) or truncated (remote). Measured in
-# tokens, not characters: 40k characters of English is ~10k tokens, but 40k characters of
-# Chinese is ~40k tokens, and the major clients reject a tool result over 25k.
+# Token budget, not chars: major clients reject a tool result over 25k tokens.
 MAX_INLINE_TOKENS = int(os.environ.get("OXYLABS_MAX_INLINE_TOKENS", "10000"))
-READ_CHUNK_CHARS = int(os.environ.get("OXYLABS_READ_CHUNK_CHARS", "40000"))
+READ_CHUNK_CHARS = 40000
 PREVIEW_CHARS = 2000
 
-# Transient upstream failures are retried here rather than handed to the agent, which has
-# no better recovery than trying again. 429 is in the set because a rate limit clears on
-# its own; a spent quota does not, which is why the attempt cap is low and the error the
-# agent finally sees says so.
 RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
 RETRIES = int(os.environ.get("OXYLABS_RETRIES", "2"))
-RETRY_BASE_DELAY = float(os.environ.get("OXYLABS_RETRY_BASE_DELAY", "1"))
+RETRY_BASE_DELAY = 1.0
 
-# Below this much visible text, a page fetched without JavaScript is probably a shell.
-THIN_CONTENT_CHARS = int(os.environ.get("OXYLABS_THIN_CONTENT_CHARS", "500"))
+THIN_CONTENT_CHARS = 500
 JS_REQUIRED_RE = re.compile(
     r"(enable|turn on|requires?|needs?)\s+(?:\w+\s+){0,3}javascript|javascript\s+is\s+"
     r"(?:required|disabled|turned off)|<noscript",
     re.IGNORECASE,
 )
-SPILL_TTL_SECONDS = float(os.environ.get("OXYLABS_SPILL_TTL_HOURS", "6")) * 3600
+SPILL_TTL_SECONDS = 6 * 3600
 
-# Writing scraped pages to disk only makes sense when the agent shares a filesystem with
-# this server, i.e. stdio. A remote HTTP server hands back a path nobody can open, so it
-# truncates instead. main() flips this on; the safe default is off.
+# Spilling to disk only helps when the agent shares the filesystem (stdio); main() flips it.
 _SPILL_ENABLED = False
 
-# The API renders the requested formats server-side via `output`, which takes a list.
 OUTPUT_PARAM = "output"
-
-# Endpoint names come from `GET /v1/scrapers`; this keeps a caller from walking the path.
 ENDPOINT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 
 try:
@@ -282,15 +264,9 @@ def _token_budget() -> int | None:
 
     Defaults to `OXYLABS_MAX_INLINE_TOKENS`, which sits under the 25k-token cap the major
     clients put on a single tool result. A client that knows its own limit can say so with
-    an `X-MCP-Max-Tokens` header or a `?max_tokens=` query parameter; `0` opts out.
+    an `X-MCP-Max-Tokens` header; `0` opts out.
     """
     declared = _http_headers().get("x-mcp-max-tokens")
-    if declared is None:
-        try:
-            declared = get_http_request().query_params.get("max_tokens")
-        except RuntimeError:  # stdio, or no HTTP request in flight
-            declared = None
-
     if declared is not None:
         try:
             asked = int(str(declared).strip())
@@ -318,8 +294,6 @@ def _detail(resp: httpx.Response) -> str:
             return "; ".join(
                 f"{p.get('key')}: {p.get('message')}" for p in problems if isinstance(p, dict)
             )
-        if isinstance(problems, dict) and problems:
-            return str(problems)[:500]
         return str(body.get("detail") or body.get("message") or body)[:500]
     return str(body)[:500]
 
@@ -622,17 +596,8 @@ def _trim(payload: dict[str, Any]) -> dict[str, Any]:
 
 # ------------------------------------------------------------------------------- jobs
 
-# ponytail: jobs live in this process only — they do not survive a restart and are not
-# shared between HTTP replicas. Move them to a store the day this runs behind more than
-# one replica; until then a dict is the whole feature.
-#
-# FastMCP's native `task=True` does all of this protocol-side — submit, poll, cancel, TTL
-# — and would delete this section along with `check_scrape`. It is not a swap-in yet:
-# it needs the `fastmcp[tasks]` extra (10 more packages, including redis and cloudpickle),
-# and its "optional" mode still runs synchronously for any client that does not ask for a
-# task, which is every client we ship to today. A synchronous JS render is the 150-second
-# tool call this dict exists to avoid, so the dict would have to stay as the fallback
-# either way. Revisit when the target clients request tasks themselves.
+# ponytail: in-process dict, one replica. fastmcp task=True replaces this once it needs no
+# [tasks] extra and the target clients request tasks themselves.
 _JOBS: dict[str, dict[str, Any]] = {}
 
 
@@ -742,12 +707,6 @@ async def search(
     """
     if not query.strip():
         raise ApiError("`query` must not be empty.")
-    if len(query) > 2048:
-        raise ApiError("`query` must be 2048 characters or fewer.")
-    if location and len(location) > 256:
-        raise ApiError("`location` must be 256 characters or fewer.")
-    if not 1 <= max_results <= 20:
-        raise ApiError("`max_results` must be an integer between 1 and 20.")
 
     payload: dict[str, Any] = {"query": query, "max_results": max_results}
     if location:
@@ -798,10 +757,6 @@ async def scrape(
     """
     if not url.startswith(("http://", "https://")):
         raise ApiError(f"`url` must be an absolute http(s) URL, got: {url!r}")
-    if format not in ("markdown", "html"):
-        raise ApiError(f'`format` must be "markdown" or "html", got: {format!r}')
-    if device is not None and device not in ("desktop", "mobile"):
-        raise ApiError(f'`device` must be "desktop" or "mobile", got: {device!r}')
 
     payload: dict[str, Any] = {"url": url, OUTPUT_PARAM: [format]}
     if location:
@@ -957,23 +912,6 @@ async def check_scrape(
     }
 
 
-class ScrapedChunk(BaseModel):
-    """A slice of an offloaded page.
-
-    Declared as a model so the tool ships a real output schema: this shape is entirely
-    ours and stable. The tools that pass an API response through keep the permissive
-    schema the SDK derives — pinning those would freeze a contract that is still moving.
-    """
-
-    path: str = Field(description="The file this chunk came from.")
-    offset: int = Field(description="Character offset this chunk starts at.")
-    returned_chars: int = Field(description="How many characters are in `text`.")
-    total_chars: int = Field(description="Size of the whole page, in characters.")
-    next_offset: int = Field(description="Pass this as `offset` to get the next chunk.")
-    eof: bool = Field(description="True when `text` reaches the end of the page.")
-    text: str = Field(description="The chunk itself.")
-
-
 @mcp.tool(annotations=_local_read("Read an offloaded page"))
 async def read_scraped(
     path: Annotated[str, Field(description="Path from a result's `content_offloaded.path`.")],
@@ -981,16 +919,14 @@ async def read_scraped(
     length: Annotated[
         int, Field(description="How many characters to return.", ge=1)
     ] = READ_CHUNK_CHARS,
-) -> ScrapedChunk:
+) -> dict[str, Any]:
     """Read a chunk of a scraped page that was offloaded to disk.
 
     Use the `path` from a scrape result's `content_offloaded`. Start at offset 0 and keep
     calling with the returned `next_offset` until `eof` is true — and stop as soon as you
-    have what you need rather than reading the whole file by reflex.
+    have what you need rather than reading the whole file by reflex. Returns `text` plus
+    `offset`, `returned_chars`, `total_chars`, `next_offset` and `eof`.
     """
-    if offset < 0 or length <= 0:
-        raise ApiError("`offset` must be >= 0 and `length` must be > 0.")
-
     # Only files this server wrote are readable — this tool is not a general file reader.
     directory = _spill_dir().resolve()
     target = Path(path).expanduser().resolve()
@@ -1007,15 +943,15 @@ async def read_scraped(
     text = target.read_text(encoding="utf-8", errors="replace")
     chunk = text[offset : offset + length]
     next_offset = offset + len(chunk)
-    return ScrapedChunk(
-        path=str(target),
-        offset=offset,
-        returned_chars=len(chunk),
-        total_chars=len(text),
-        next_offset=next_offset,
-        eof=next_offset >= len(text),
-        text=chunk,
-    )
+    return {
+        "path": str(target),
+        "offset": offset,
+        "returned_chars": len(chunk),
+        "total_chars": len(text),
+        "next_offset": next_offset,
+        "eof": next_offset >= len(text),
+        "text": chunk,
+    }
 
 
 @mcp.tool(annotations=_network_read("List scrape endpoints"))
@@ -1072,8 +1008,6 @@ async def scrape_target(
     it here. A `run_js` in `params` returns a job id to poll, same as `scrape`.
     """
     name = _endpoint_name(endpoint)
-    if not isinstance(params, dict):
-        raise ApiError("`params` must be an object of request fields for the endpoint.")
 
     fmt = "markdown"
     output = params.get(OUTPUT_PARAM)
@@ -1092,9 +1026,7 @@ async def scrape_target(
 
 def _endpoint_name(endpoint: str) -> str:
     """Accept an endpoint name, not a path — this must not become a URL builder."""
-    name = endpoint.strip().strip("/")
-    if name.startswith("v1/"):
-        name = name[3:]
+    name = endpoint.strip()
     if not ENDPOINT_RE.match(name):
         raise ApiError(
             f"{endpoint!r} is not an endpoint name. Pass one of the names from "
@@ -1140,21 +1072,6 @@ def skill_resource() -> str:
     return _skill_text()
 
 
-@mcp.resource(
-    "oxylabs://tools/list",
-    name="oxylabs_tools_list",
-    title="Tool inventory",
-    description="This server's tools and what each is for.",
-    mime_type="text/markdown",
-)
-async def tools_resource() -> str:
-    lines = ["# Tools on this server", ""]
-    for tool in await mcp.list_tools():
-        summary = (tool.description or "").strip().splitlines()
-        lines.append(f"- **{tool.name}** — {summary[0] if summary else ''}")
-    return "\n".join(lines)
-
-
 @mcp.prompt(
     name="web_research",
     title="Research a question from live sources",
@@ -1185,9 +1102,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="oxylabs-web-api-mcp", description=__doc__)
     parser.add_argument(
         "--transport",
-        # "streamable-http" is FastMCP's older name for "http"; both are accepted so an
-        # existing MCP_TRANSPORT or docker-compose file keeps working.
-        choices=["stdio", "http", "streamable-http"],
+        choices=["stdio", "http"],
         default=os.environ.get("MCP_TRANSPORT", "stdio"),
         help="stdio for local clients, http when self-hosting (default: stdio)",
     )
