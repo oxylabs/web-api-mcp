@@ -27,7 +27,6 @@ earns its cost, what to do with an empty page, how to cite.
 | | |
 |---|---|
 | `oxylabs://skill/web-api` | The skill itself, as Markdown |
-| `oxylabs://tools/list` | This server's tools and what each is for |
 | prompt `web_research` | Takes a `question`, hands the agent the task plus the skill |
 
 `scripts/sync-skill.sh` refreshes the bundled copy from the skills repo — the canonical
@@ -39,8 +38,8 @@ Oversized content is measured in **tokens, not characters**: 40 000 characters o
 is about 10 000 tokens, but 40 000 characters of Chinese is about 40 000, and Claude Code,
 Claude Desktop and Cursor all reject a tool result over 25 000. The estimate is script-aware
 for that reason. The budget is `OXYLABS_MAX_INLINE_TOKENS` (default 10 000), and a client
-that knows its own limit can override it per request with an `X-MCP-Max-Tokens` header or
-`?max_tokens=` on the URL — `0` opts out entirely.
+that knows its own limit can override it per request with an `X-MCP-Max-Tokens` header —
+`0` opts out entirely.
 
 ## JavaScript rendering is a job, not a wait
 
@@ -76,8 +75,7 @@ with almost no visible text — or with a "please enable JavaScript" notice — 
 
 HTML is measured on its text, not its markup, so a 3 KB shell of `<meta>` tags still reads
 as thin. The flag is a hint, not a retry: rendering is slow and billed, and a genuinely
-short page would pay for it on every fetch. The threshold is `OXYLABS_THIN_CONTENT_CHARS`
-(default 500).
+short page would pay for it on every fetch. The threshold is 500 visible characters.
 
 Jobs live in the server process: they do not survive a restart, and they are not shared
 between HTTP replicas. Run one replica, or give it sticky sessions.
@@ -192,18 +190,13 @@ docker run --rm -p 8080:8080 \
 | `OXYLABS_BASE_URL` | `https://webapi.oxylabs.io` | Override for staging or a proxy |
 | `OXYLABS_TIMEOUT` | `120` | Per-request timeout in seconds |
 | `OXYLABS_RETRIES` | `2` | Retries on a transient 429/500/502/503/504 |
-| `OXYLABS_RETRY_BASE_DELAY` | `1` | Backoff ceiling before the first retry, doubling after; the wait is jittered within it |
 | `OXYLABS_RATE_LIMIT` | *(off)* | Cap this server's own spend, e.g. `100/1h`, `50/30m` |
-| `OXYLABS_JS_TIMEOUT` | `150` | Timeout for background JavaScript-rendering jobs, matching the upstream render ceiling |
 | `OXYLABS_JOB_TTL_MINUTES` | `60` | How long a finished job's result stays pollable |
-| `OXYLABS_THIN_CONTENT_CHARS` | `500` | Below this much visible text, a page is flagged `content_thin` |
 | `OXYLABS_EXTRACT_APPROVAL` | `1` | Set to `0` to skip the user prompt on `extract` |
 | `OXYLABS_MAX_INLINE_TOKENS` | `10000` | Above this, content is offloaded or truncated |
-| `OXYLABS_READ_CHUNK_CHARS` | `40000` | Default chunk size for `read_scraped` |
 | `OXYLABS_SPILL_DIR` | system temp | Where offloaded pages are written (stdio only) |
-| `OXYLABS_SPILL_TTL_HOURS` | `6` | Offloaded pages older than this are pruned on write |
 | `OXYLABS_SPILL` | `1` | Set to `0` to keep everything inline even on stdio |
-| `MCP_TRANSPORT` | `stdio` | `stdio` or `http` (`streamable-http` still accepted) |
+| `MCP_TRANSPORT` | `stdio` | `stdio` or `http` |
 | `HOST` / `PORT` | `127.0.0.1` / `8080` | HTTP transport bind address |
 | `MCP_ALLOWED_HOSTS` | `localhost:*,127.0.0.1:*` | Comma-separated `Host` allowlist (HTTP only) |
 | `MCP_ALLOWED_ORIGINS` | *(empty)* | Comma-separated `Origin` allowlist (browser clients) |

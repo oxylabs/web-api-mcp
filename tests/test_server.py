@@ -22,7 +22,6 @@ from oxylabs_web_api_mcp.server import (  # noqa: E402
     read_scraped,
     scrape,
     scrape_target,
-    search,
 )
 
 
@@ -54,10 +53,10 @@ def test_search_rejects_bad_input_before_calling_the_api():
         {"query": "ok", "max_results": 21},
     ):
         try:
-            asyncio.run(search(**kwargs))
-        except ApiError:
+            asyncio.run(srv.mcp.call_tool("search", kwargs))
+        except Exception:  # noqa: BLE001 — ApiError or FastMCP's own validation error
             continue
-        raise AssertionError(f"expected ApiError for {kwargs}")
+        raise AssertionError(f"expected an error for {kwargs}")
 
 
 def test_scrape_rejects_relative_urls():
@@ -97,9 +96,9 @@ def test_oversized_content_spills_to_disk_when_local(tmp_dir=None):
 
         # The agent walks the file in chunks and reaches the end.
         first = asyncio.run(read_scraped(info["path"], offset=0, length=1000))
-        assert first.returned_chars == 1000 and not first.eof, first
+        assert first["returned_chars"] == 1000 and not first["eof"], first
         last = asyncio.run(read_scraped(info["path"], offset=size - 10, length=1000))
-        assert last.eof and last.returned_chars == 10, last
+        assert last["eof"] and last["returned_chars"] == 10, last
     finally:
         srv._SPILL_ENABLED = False
         del os.environ["OXYLABS_SPILL_DIR"]
@@ -133,8 +132,8 @@ def test_read_scraped_refuses_paths_outside_the_spill_dir():
 
 def test_scrape_rejects_unknown_format():
     try:
-        asyncio.run(scrape("https://ex.com", format="pdf"))
-    except ApiError:
+        asyncio.run(srv.mcp.call_tool("scrape", {"url": "https://ex.com", "format": "pdf"}))
+    except Exception:  # noqa: BLE001 — FastMCP rejects it before the tool body runs
         return
     raise AssertionError("expected ApiError for an unsupported format")
 
