@@ -19,7 +19,7 @@ connected, the **helper script**, then **curl**.
 
 | Call | Expect |
 |---|---|
-| `search` | **p50 1.3s, p95 2.7s** — measured over 2 589 live queries at concurrency 5, all `201` |
+| `search` | **p50 1.3s, p95 2.7s** — measured over 2 589 live queries at concurrency 5, all `2xx` |
 | `scrape` without `run_js` | seconds, not milliseconds — one page, one fetch |
 | `scrape` with `run_js` | **30s and up.** Returns a job id; poll it, don't wait on it |
 | `extract` | a scrape plus model parsing, and billed above a scrape |

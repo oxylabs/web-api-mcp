@@ -689,7 +689,7 @@ def test_a_2xx_carrying_faulted_is_not_treated_as_success():
     stub = _stub_client(
         lambda m, u: httpx.Response(
             200,
-            json={"status": "faulted", "message": "upstream gave up"},
+            json={"status": "faulted", "results": [], "metadata": {"request_id": "req-42"}},
             request=httpx.Request(m, u),
         )
     )
@@ -698,7 +698,7 @@ def test_a_2xx_carrying_faulted_is_not_treated_as_success():
     try:
         asyncio.run(srv._request("POST", "/v1/search", {"query": "x"}))
     except ApiError as exc:
-        assert "faulted" in str(exc), exc
+        assert "faulted" in str(exc) and "req-42" in str(exc), exc
     else:
         raise AssertionError("a 2xx with status=faulted is a failure, not a result")
     finally:
