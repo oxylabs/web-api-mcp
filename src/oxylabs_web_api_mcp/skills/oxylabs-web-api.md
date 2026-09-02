@@ -13,13 +13,13 @@ metadata:
 Two endpoints. `search` finds URLs, `scrape` reads them. Base URL `https://webapi.oxylabs.io`.
 
 Three ways to call them, in order of preference: the **MCP tools** if the server is
-connected, the **helper script**, then **curl**.
+connected, the **helper script**, then **raw HTTP** with any client.
 
 ## What it costs you in time
 
 | Call | Expect |
 |---|---|
-| `search` | **p50 1.3s, p95 2.7s** — measured over 2 589 live queries at concurrency 5, all `201` |
+| `search` | **p50 1.3s, p95 2.7s** — measured over 2k+ live queries|
 | `scrape` without `run_js` | seconds, not milliseconds — one page, one fetch |
 | `scrape` with `run_js` | **30s and up.** Returns a job id; poll it, don't wait on it |
 | `extract` | a scrape plus model parsing, and billed above a scrape |
@@ -36,10 +36,10 @@ more, or both:
 |---|---|---|
 | Find pages on a topic | `search` | No URL yet. One question per search |
 | Read a page you have a URL for | `scrape` | The default. Markdown, one fetch |
-| Read a page that came back empty | `scrape` + `run_js=True` | Only after a plain scrape returned `content_thin` |
+| Read a page that came back empty or with indication that it requires javascript rendering | `scrape` + `run_js=True` | Only after a plain scrape returned `content_thin` |
 | Collect a render job | `check_scrape` | After a `run_js` call, ~30s later, then every ~10s to 150s |
 | Walk a page too big to return | `read_scraped` | The result carried `content_offloaded` |
-| Named fields, not a page to read | `extract` | You need the same fields off several pages. Billed above a scrape, and the user approves each run |
+| Named fields, not a page to read | `extract` | You need structured data from a page. You need the same fields off several pages. Billed above a scrape, and the user approves each run |
 | A target-specific scraper | `list_scrapers` then `scrape_target` | The generic scraper does not carry the parameter you need |
 
 **Done when:** the narrowest call that could answer the question has run, you have read its
@@ -77,7 +77,7 @@ you are the one reasoning about it.
 
 If the `oxylabs-web-api` MCP tools are in your tool list, use them — the server holds the
 key, and you need nothing in your shell. Check for a `search`/`scrape` pair from that
-server before reaching for curl.
+server before falling back to the helper script or raw HTTP.
 
 Otherwise the key lives in `OXYLABS_WEB_API_KEY`. If it is unset, stop and ask the user for it
 rather than guessing — every call will 401 without it.
@@ -105,18 +105,16 @@ worth checking before debugging anything else.
 typed tools. Prefer them when they are available: no key in your shell, no JSON to
 hand-assemble, and oversized pages are handled for you.
 
-| Tool | Use it for |
-|---|---|
-| `search(query, max_results, location)` | Find URLs. Same fields as `POST /v1/search`. |
-| `scrape(url, format, location, device, run_js)` | Read one page. `format` is `"markdown"` (default) or `"html"`. |
-| `extract(url, prompt, location, run_js)` | Named fields as JSON instead of a page to read. |
-| `check_scrape(job_id)` | Collect a JavaScript-rendering job. |
-| `read_scraped(path, offset, length)` | Walk a large page that was written to disk. |
-| `list_scrapers(endpoint)` | List target-specific endpoints, or describe one's parameters. |
-| `scrape_target(endpoint, params)` | Call one of those endpoints. |
+The signatures — *which* tool to reach for is the decision table above:
 
-Every parameter carries the meaning it has in the HTTP tables below — `location` on
-`scrape` is still a country code, `location` on `search` is still a place name.
+`search(query, max_results, location)` · `scrape(url, format, location, device, run_js)`
+· `extract(url, prompt, location, run_js)` · `check_scrape(job_id)` ·
+`read_scraped(path, offset, length)` · `list_scrapers(endpoint)` ·
+`scrape_target(endpoint, params)`
+
+`scrape`'s `format` is `"markdown"` (default) or `"html"`. Every other parameter carries
+the meaning it has in the field tables below — `location` on `scrape` is still a country
+code, `location` on `search` is still a place name.
 
 ### JavaScript rendering comes back as a job
 
@@ -142,7 +140,7 @@ nothing to read. The tool flags that for you rather than leaving you to guess:
 
 ```jsonc
 {
-  "content": "# Loading…",
+  "markdown": "# Loading…",
   "content_thin": { "visible_chars": 9, "reason": "almost no text", "note": "…" }
 }
 ```
@@ -185,14 +183,15 @@ page in because it was offered is the mistake this is designed to prevent.
 types, then `scrape_target(endpoint, params)` to call it. Read the parameters rather than
 guessing them — that response is more current than any documentation, including this file.
 
-## Search
+## The endpoints
 
-```bash
-curl -sS https://webapi.oxylabs.io/v1/search \
-  -H "Authorization: Bearer $OXYLABS_WEB_API_KEY" \
-  -H 'Content-Type: application/json' \
-  -d '{"query": "eu ai act compliance deadlines", "max_results": 5}'
-```
+Both calls are one shape: `POST https://webapi.oxylabs.io/v1/search` or `/v1/scrape`,
+with `Authorization: Bearer $OXYLABS_WEB_API_KEY`, `Content-Type: application/json`, and a
+JSON body from the tables below. `GET /v1/scrapers` (same auth) lists the target-specific
+endpoints. Any HTTP client works — this is also the contract to code against when
+integrating the API into an application.
+
+### Search — `POST /v1/search`
 
 | Field | Type | Notes |
 |---|---|---|
@@ -209,15 +208,7 @@ it, because `faulted` can arrive with a `2xx`.
 **Descriptions are search snippets, not page content.** Never answer a factual question
 from `shortDescription` alone — it is truncated and often stale. Scrape the source.
 
-## Scrape
-
-```bash
-curl -sS https://webapi.oxylabs.io/v1/scrape \
-  -H "Authorization: Bearer $OXYLABS_WEB_API_KEY" \
-  -H 'Content-Type: application/json' \
-  -d '{"url": "https://en.wikipedia.org/wiki/Artificial_intelligence",
-       "output": ["markdown"]}'
-```
+### Scrape — `POST /v1/scrape`
 
 | Field | Type | Notes |
 |---|---|---|
@@ -238,12 +229,12 @@ Need particular fields rather than a whole page? A `json.prompt` returns them st
 no selectors to maintain — keep `"json"` out of `output`, which is the built-in parser and
 contends with the extraction for the result's `json` key.
 
-**If the Markdown comes back nearly empty, the page rendered client-side.** Over raw HTTP
-nothing flags this for you, so check it yourself: a couple of hundred characters, a bare
-heading, or a "you need to enable JavaScript" line means you got the shell, not the page.
-Retry the same request once with `run_js: true` — it is much slower, which is why it is not
-the default — and if that is empty too, report the page as unreadable rather than working
-from memory.
+**If the Markdown comes back nearly empty, the page rendered client-side.** Outside the
+MCP tools nothing flags this for you, so check it yourself: a couple of hundred characters,
+a bare heading, or a "you need to enable JavaScript" line means you got the shell, not the
+page. Retry the same request once with `run_js: true` (`--run-js` in the helper script) —
+it is much slower, which is why it is not the default — and if that is empty too, report
+the page as unreadable rather than working from memory.
 
 Note the two endpoints spell geo differently: `/v1/search` takes a place name
 (`"Germany"`), `/v1/scrape` takes a country code (`"DE"`).
@@ -252,29 +243,32 @@ Scrape is heavier than search — expect seconds, not milliseconds, and don't fi
 parallel. Pages get long: read what you need and stop rather than pulling an entire page
 into context because it was returned.
 
-For target-specific scrapers and their parameters, ask the API instead of guessing:
-
-```bash
-curl -sS https://webapi.oxylabs.io/v1/scrapers -H "Authorization: Bearer $OXYLABS_WEB_API_KEY"
-curl -sS -X OPTIONS https://webapi.oxylabs.io/v1/scrape -H "Authorization: Bearer $OXYLABS_WEB_API_KEY"
-```
+For target-specific scrapers and their parameters, ask the API (`GET /v1/scrapers`)
+instead of guessing — that response is more current than any documentation.
 
 ## Helper script
 
-When the MCP tools are not available, `scripts/web_api.py` wraps both endpoints with
-retries on 429/5xx and prints JSON:
+When the MCP tools are not available, `scripts/web_api.py` is the fallback: it wraps both
+endpoints with input validation, retries with jittered backoff on 429/5xx, detection of
+`faulted` inside a 2xx, and prints JSON:
 
 ```bash
 python scripts/web_api.py search "who acquired figma" --max-results 5
 python scripts/web_api.py scrape "https://example.com/article"
 python scripts/web_api.py scrape "https://example.com/article" --format html
+python scripts/web_api.py scrape "https://example.com/app" --run-js
 python scripts/web_api.py search "best rain jacket 2026" --max-results 3 --scrape-top 2
 ```
 
-Scrapes default to Markdown.
+Scrapes default to Markdown. `--run-js` is the empty-page retry — same rules as the MCP
+path: plain scrape first, retry once, never pre-emptively.
 
 `--scrape-top N` runs the search-then-read loop in one command, which is the pattern you
 want most of the time.
+
+The script covers the common path only. What it does not carry — `output: ["json"]`,
+screenshots, `device`, target-specific scrapers — goes over raw HTTP using the
+contract above.
 
 ## Errors
 
