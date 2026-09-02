@@ -108,7 +108,7 @@ hand-assemble, and oversized pages are handled for you.
 | Tool | Use it for |
 |---|---|
 | `search(query, max_results, location)` | Find URLs. Same fields as `POST /v1/search`. |
-| `scrape(url, format, location, device, run_js, check_empty_geo)` | Read one page. `format` is `"markdown"` (default) or `"html"`. |
+| `scrape(url, format, location, device, run_js)` | Read one page. `format` is `"markdown"` (default) or `"html"`. |
 | `extract(url, prompt, location, run_js)` | Named fields as JSON instead of a page to read. |
 | `check_scrape(job_id)` | Collect a JavaScript-rendering job. |
 | `read_scraped(path, offset, length)` | Walk a large page that was written to disk. |
@@ -223,20 +223,20 @@ curl -sS https://webapi.oxylabs.io/v1/scrape \
 |---|---|---|
 | `url` | string, **required** | Absolute `http(s)` URL. |
 | `output` | array | `["markdown"]`, `["html"]`, `["json"]`, `["screenshot"]`, or a combination. |
-| `json` | object | With `output: ["json"]`: `{"prompt": "fields to extract"}`. |
+| `json` | object | `{"prompt": "fields to extract"}` — AI extraction, delivered under the result's `json` key. Do not also put `"json"` in `output`: that runs the route's built-in parser, and the two contend for the same key. |
 | `location` | string | Two-letter country code, e.g. `"DE"`. |
 | `device` | string | `"desktop"` or `"mobile"`. |
 | `run_js` | boolean | Execute page JavaScript. |
 | `disable_scripts` | boolean | Block scripts. |
-| `check_empty_geo` | boolean | Fail instead of returning wrong-country content. |
 
 **Always send `output: ["markdown"]` when reading a page.** The API renders Markdown
 server-side: a fraction of the tokens of HTML, structure intact. Never fetch HTML and
 convert it yourself — that burns context on markup you were going to throw away. Use
 `["html"]` only when you need the markup itself.
 
-Need particular fields rather than a whole page? `output: ["json"]` with a `json.prompt`
-returns them structured, no selectors to maintain.
+Need particular fields rather than a whole page? A `json.prompt` returns them structured,
+no selectors to maintain — keep `"json"` out of `output`, which is the built-in parser and
+contends with the extraction for the result's `json` key.
 
 **If the Markdown comes back nearly empty, the page rendered client-side.** Over raw HTTP
 nothing flags this for you, so check it yourself: a couple of hundred characters, a bare

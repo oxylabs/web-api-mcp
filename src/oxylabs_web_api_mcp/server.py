@@ -116,8 +116,10 @@ _SPILL_ENABLED = False
 # The API renders the requested formats server-side via `output`, which takes a list.
 OUTPUT_PARAM = "output"
 
-# Endpoint names come from `GET /v1/scrapers`; this keeps a caller from walking the path.
-ENDPOINT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+# Endpoint names come from `GET /v1/scrapers` as slash-separated source paths
+# (`scrape/amazon/search`). Each segment is validated on its own, so a caller
+# cannot walk the path with `..`, a scheme, or a query string.
+ENDPOINT_SEGMENT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 
 try:
     VERSION = _package_version("oxylabs-web-api-mcp")
@@ -183,17 +185,6 @@ RUN_JS_PARAM = Annotated[
         )
     ),
 ]
-CHECK_EMPTY_GEO_PARAM = Annotated[
-    bool,
-    Field(
-        description=(
-            "Fail the request rather than return content that ignored `location`. Use it "
-            "when content for the wrong market would be worse than an error."
-        )
-    ),
-]
-
-
 # -------------------------------------------------------------------------------- http
 
 
@@ -483,12 +474,22 @@ def _spill(text: str, url: str, fmt: str) -> Path:
     return path
 
 
+def _result_url(result: dict[str, Any]) -> str:
+    """The URL actually scraped for this result — it sits in the result's `metadata`."""
+    metadata = result.get("metadata")
+    return str(metadata.get("url") or "") if isinstance(metadata, dict) else ""
+
+
 def _offload(result: dict[str, Any], text: str, url: str, fmt: str, budget: int) -> None:
-    """Replace oversized `content` in place with a pointer or a truncation notice."""
+    """Replace oversized page text under the format's key with a pointer or a notice.
+
+    Each requested `output` value comes back under its own result key (`markdown`,
+    `html`) — verified against the live API, which returns no fused `content` field.
+    """
     tokens = _estimate_tokens(text)
     if _SPILL_ENABLED:
         path = _spill(text, url, fmt)
-        result["content"] = text[:PREVIEW_CHARS]
+        result[fmt] = text[:PREVIEW_CHARS]
         result["content_offloaded"] = {
             "path": str(path),
             "format": fmt,
@@ -496,7 +497,7 @@ def _offload(result: dict[str, Any], text: str, url: str, fmt: str, budget: int)
             "estimated_tokens": tokens,
             "preview_chars": min(PREVIEW_CHARS, len(text)),
             "note": (
-                "`content` above is only the first "
+                f"`{fmt}` above is only the first "
                 f"{min(PREVIEW_CHARS, len(text))} characters. The full page is on disk. "
                 "Read it with the `read_scraped` tool: read_scraped(path, offset=0), then "
                 "keep calling it with the `next_offset` it returns until `eof` is true. "
@@ -507,7 +508,7 @@ def _offload(result: dict[str, Any], text: str, url: str, fmt: str, budget: int)
         # Token density is roughly uniform within a page, so a proportional cut lands
         # close enough to the budget without counting the whole thing twice.
         keep = max(1, int(len(text) * budget / tokens))
-        result["content"] = text[:keep]
+        result[fmt] = text[:keep]
         result["content_truncated"] = {
             "total_chars": len(text),
             "returned_chars": min(keep, len(text)),
@@ -537,7 +538,7 @@ def _process_content(payload: dict[str, Any], fmt: str, budget: int | None) -> d
     for result in results:
         if not isinstance(result, dict):
             continue
-        content = result.get("content")
+        content = result.get(fmt)
         if not isinstance(content, str):
             continue
         # A token is never fewer than one byte, so anything this short cannot overflow;
@@ -545,7 +546,7 @@ def _process_content(payload: dict[str, Any], fmt: str, budget: int | None) -> d
         if len(content) <= budget:
             continue
         if _estimate_tokens(content) > budget:
-            _offload(result, content, str(result.get("url") or requested_url), fmt, budget)
+            _offload(result, content, _result_url(result) or requested_url, fmt, budget)
     return payload
 
 
@@ -577,7 +578,7 @@ def _flag_thin_content(payload: dict[str, Any]) -> dict[str, Any]:
     for result in results:
         if not isinstance(result, dict):
             continue
-        content = result.get("content")
+        content = result.get(fmt)
         # Offloaded content is, by definition, not thin.
         if not isinstance(content, str) or "content_offloaded" in result:
             continue
@@ -775,7 +776,6 @@ async def scrape(
         Field(description="Viewport to fetch as. Upstream default is desktop."),
     ] = None,
     run_js: RUN_JS_PARAM = False,
-    check_empty_geo: CHECK_EMPTY_GEO_PARAM = False,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Fetch and read a single URL, including JavaScript-heavy and bot-protected pages.
@@ -808,8 +808,6 @@ async def scrape(
         payload["location"] = location
     if device:
         payload["device"] = device
-    if check_empty_geo:
-        payload["check_empty_geo"] = True
 
     if run_js:
         payload["run_js"] = True
@@ -861,18 +859,22 @@ async def extract(
 
     await _confirm_extract(url, prompt, ctx)
 
-    payload: dict[str, Any] = {"url": url, OUTPUT_PARAM: ["json"], "json": {"prompt": prompt}}
+    # The root `json` field is the caller-defined extraction; `output` must not also ask
+    # for "json" — that runs the route's built-in parser, and both deliver under the same
+    # `json` result key, so requesting both makes them contend for it. Markdown is the
+    # cheapest page representation to carry alongside the extraction.
+    payload: dict[str, Any] = {"url": url, OUTPUT_PARAM: ["markdown"], "json": {"prompt": prompt}}
     if location:
         payload["location"] = location
 
     if run_js:
         payload["run_js"] = True
         await _note(ctx, f"Extracting from {url} with JavaScript in the background")
-        return _submit_job("/v1/scrape", payload, "json", _api_key(), _token_budget())
+        return _submit_job("/v1/scrape", payload, "markdown", _api_key(), _token_budget())
 
     await _note(ctx, f"Extracting from {url}")
     response = await _request("POST", "/v1/scrape", payload, ctx=ctx)
-    return _trim(_process_content(response, "json", _token_budget()))
+    return _trim(_process_content(response, "markdown", _token_budget()))
 
 
 def _client_can_elicit(ctx: Context | None) -> bool:
@@ -1027,7 +1029,7 @@ async def list_scrapers(
                 "Name a scrape endpoint to get its parameters and their types instead of "
                 "the list. Omit it to list what exists."
             ),
-            examples=["scrape"],
+            examples=["scrape/amazon/search"],
         ),
     ] = None,
     ctx: Context | None = None,
@@ -1051,7 +1053,12 @@ async def list_scrapers(
 async def scrape_target(
     endpoint: Annotated[
         str,
-        Field(description="A scrape endpoint name from `list_scrapers`, without the /v1/ prefix."),
+        Field(
+            description=(
+                "A scrape endpoint path from `list_scrapers`, without the /v1/ prefix, "
+                "e.g. 'scrape/amazon/search'."
+            )
+        ),
     ],
     params: Annotated[
         dict[str, Any],
@@ -1091,14 +1098,14 @@ async def scrape_target(
 
 
 def _endpoint_name(endpoint: str) -> str:
-    """Accept an endpoint name, not a path — this must not become a URL builder."""
+    """Accept a source path from `list_scrapers`, not a URL — every segment is checked."""
     name = endpoint.strip().strip("/")
     if name.startswith("v1/"):
         name = name[3:]
-    if not ENDPOINT_RE.match(name):
+    if not name or not all(ENDPOINT_SEGMENT_RE.match(seg) for seg in name.split("/")):
         raise ApiError(
-            f"{endpoint!r} is not an endpoint name. Pass one of the names from "
-            "`list_scrapers()`, e.g. 'scrape'."
+            f"{endpoint!r} is not an endpoint name. Pass one of the paths from "
+            "`list_scrapers()` without the /v1/ prefix, e.g. 'scrape/amazon/search'."
         )
     return name
 

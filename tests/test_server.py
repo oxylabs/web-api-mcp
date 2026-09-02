@@ -69,9 +69,11 @@ def test_scrape_rejects_relative_urls():
 
 
 def _big_payload(chars: int) -> dict:
+    # The live API's result shape: page text under the format's own key, the scraped
+    # URL under the result's `metadata` — there is no fused `content` field.
     return {
         "status": "done",
-        "results": [{"content": "x" * chars, "url": "https://ex.com/a"}],
+        "results": [{"markdown": "x" * chars, "metadata": {"url": "https://ex.com/a"}}],
         "params": {"url": "https://ex.com/a"},
     }
 
@@ -89,7 +91,7 @@ def test_oversized_content_spills_to_disk_when_local(tmp_dir=None):
         info = result["content_offloaded"]
 
         assert info["total_chars"] == size, info
-        assert len(result["content"]) == srv.PREVIEW_CHARS, len(result["content"])
+        assert len(result["markdown"]) == srv.PREVIEW_CHARS, len(result["markdown"])
         assert "content_truncated" not in result
         assert os.path.isfile(info["path"]), info
 
@@ -116,7 +118,7 @@ def test_oversized_content_truncates_when_remote():
 
 def test_small_content_is_left_alone():
     out = srv._process_content(_big_payload(100), "markdown", srv.MAX_INLINE_TOKENS)["results"][0]
-    assert out["content"] == "x" * 100
+    assert out["markdown"] == "x" * 100
     assert "content_offloaded" not in out and "content_truncated" not in out
 
 
@@ -212,8 +214,10 @@ def test_trim_drops_the_echo_but_keeps_the_request_id():
 
 def test_endpoint_names_cannot_walk_the_path():
     assert srv._endpoint_name("scrape") == "scrape"
-    assert srv._endpoint_name("/v1/amazon_search/") == "amazon_search"
-    for bad in ("../admin", "scrape?x=1", "v1/../../etc", "HTTP://evil", ""):
+    # /v1/scrapers returns slash-separated source paths; those must pass whole.
+    assert srv._endpoint_name("scrape/amazon/search") == "scrape/amazon/search"
+    assert srv._endpoint_name("/v1/scrape/youtube/search/max/") == "scrape/youtube/search/max"
+    for bad in ("../admin", "scrape?x=1", "v1/../../etc", "scrape/../etc", "HTTP://evil", ""):
         try:
             srv._endpoint_name(bad)
         except ApiError:
@@ -225,7 +229,7 @@ def _run_js_job(call):
     """Run a run_js tool call against a stubbed API and poll it to completion."""
 
     async def fake_request(method, path, payload=None, **kwargs):
-        return {"results": [{"content": "rendered", "url": payload["url"]}], "params": payload}
+        return {"results": [{"markdown": "rendered"}], "params": payload}
 
     real = srv._request
     srv._request = fake_request
@@ -246,7 +250,7 @@ def test_run_js_returns_a_job_to_poll_and_then_the_content():
     started, done = _run_js_job(lambda: scrape("https://ex.com", run_js=True))
     assert "check_scrape" in started["note"]
     assert done["status"] == "done"
-    assert done["result"]["results"][0]["content"] == "rendered", done
+    assert done["result"]["results"][0]["markdown"] == "rendered", done
     # The envelope echo is gone by the time the agent sees it.
     assert "params" not in done["result"]
 
@@ -326,7 +330,7 @@ def test_extract_needs_the_user_to_approve_the_extra_cost():
 
     async def fake_request(method, path, payload=None, **kwargs):
         calls.append(payload)
-        return {"results": [{"content": {"title": "t"}}], "params": payload}
+        return {"results": [{"json": {"title": "t"}}], "params": payload}
 
     real = srv._request
     srv._request = fake_request
@@ -355,22 +359,24 @@ def test_extract_needs_the_user_to_approve_the_extra_cost():
             raise AssertionError("no elicitation support must stop the call")
         assert not calls
 
-        # Accepted: the prompt goes out as a json output request.
+        # Accepted: the prompt goes out as the root `json` extraction field. `output` must
+        # NOT also ask for "json" — that runs the built-in parser, and both deliver under
+        # the same `json` result key, contending for it.
         out = asyncio.run(
             extract(
                 "https://ex.com", "the title", ctx=_FakeCtx(elicitation={}, answer=("accept", True))
             )
         )
         assert calls[0]["json"] == {"prompt": "the title"}, calls
-        assert calls[0][srv.OUTPUT_PARAM] == ["json"]
-        assert out["results"][0]["content"] == {"title": "t"}
+        assert calls[0][srv.OUTPUT_PARAM] == ["markdown"]
+        assert out["results"][0]["json"] == {"title": "t"}
     finally:
         srv._request = real
 
 
 def test_extract_approval_can_be_waived_by_the_operator():
     async def fake_request(method, path, payload=None, **kwargs):
-        return {"results": [{"content": {}}], "params": payload}
+        return {"results": [{"json": {}}], "params": payload}
 
     real = srv._request
     srv._request = fake_request
@@ -384,7 +390,7 @@ def test_extract_approval_can_be_waived_by_the_operator():
 
 def _page(content, output="markdown"):
     return {
-        "results": [{"content": content, "url": "https://ex.com/a"}],
+        "results": [{output: content, "metadata": {"url": "https://ex.com/a"}}],
         "params": {"output": [output]},
     }
 
@@ -465,7 +471,7 @@ def test_token_estimate_is_script_aware():
 
 def test_a_cjk_page_that_fits_in_chars_is_still_offloaded():
     srv._SPILL_ENABLED = False
-    page = {"results": [{"content": "\u4e2d" * 20000, "url": "https://ex.com"}], "params": {}}
+    page = {"results": [{"markdown": "\u4e2d" * 20000}], "params": {}}
     out = srv._process_content(page, "markdown", srv.MAX_INLINE_TOKENS)["results"][0]
     assert "content_truncated" in out, "20k CJK chars is ~20k tokens and must not go inline"
     assert out["content_truncated"]["estimated_tokens"] == 20000
@@ -483,7 +489,7 @@ def test_client_can_declare_its_own_token_budget():
 
 def test_truncation_notice_says_how_to_get_the_rest():
     srv._SPILL_ENABLED = False
-    page = {"results": [{"content": "word " * 40000, "url": "https://ex.com"}], "params": {}}
+    page = {"results": [{"markdown": "word " * 40000}], "params": {}}
     note = srv._process_content(page, "markdown", 1000)["results"][0]["content_truncated"]["note"]
     for hint in ("X-MCP-Max-Tokens", "stdio", "extract"):
         assert hint in note, note
