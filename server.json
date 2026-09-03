@@ -7,5 +7,21 @@
     "source": "github"
   },
   "websiteUrl": "https://oxylabs.io",
-  "version": "0.1.0"
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "oxylabs-web-api-mcp",
+      "version": "0.1.0",
+      "transport": { "type": "stdio" },
+      "environmentVariables": [
+        {
+          "name": "OXYLABS_WEB_API_KEY",
+          "description": "Oxylabs Web API key, from a Web API instance in the Oxylabs dashboard.",
+          "isRequired": true,
+          "isSecret": true
+        }
+      ]
+    }
+  ]
 }

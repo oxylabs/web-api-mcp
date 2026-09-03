@@ -1,5 +1,7 @@
 # Oxylabs Web API — MCP Server
 
+mcp-name: io.oxylabs/web-api-mcp
+
 A self-hostable [Model Context Protocol](https://modelcontextprotocol.io) server that gives
 any MCP-capable agent live web access through the Oxylabs Web API.
 
