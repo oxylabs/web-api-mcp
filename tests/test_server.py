@@ -296,6 +296,7 @@ def test_a_slow_render_is_not_reported_as_a_stuck_one():
             "status": "running",
             "created": time.time() - age,
             "url": "https://ex.com",
+            "key_fingerprint": srv._key_fingerprint("test-key"),
             "result": None,
             "error": None,
         }
@@ -322,6 +323,20 @@ def test_check_scrape_rejects_an_unknown_job():
     except ApiError:
         return
     raise AssertionError("expected ApiError for an unknown job id")
+
+
+def test_jobs_are_bound_to_the_key_that_started_them():
+    started, done = _run_js_job(lambda: scrape("https://ex.com", run_js=True))
+    assert done["status"] == "done"
+    # A different bearer key gets the same answer as an unknown id — a job result
+    # belongs to the caller who paid for it, and no oracle confirms the id exists.
+    with _headers({"authorization": "Bearer someone-elses-key"}):
+        try:
+            asyncio.run(check_scrape(started["job_id"]))
+        except ApiError as exc:
+            assert "No job" in str(exc), exc
+        else:
+            raise AssertionError("a job must not be pollable with a different key")
 
 
 def test_extract_needs_the_user_to_approve_the_extra_cost():

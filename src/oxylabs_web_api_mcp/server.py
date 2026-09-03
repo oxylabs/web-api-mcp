@@ -633,6 +633,11 @@ async def _run_job(
     record["finished"] = time.time()
 
 
+def _key_fingerprint(key: str) -> str:
+    """A comparable stand-in for an API key that is safe to keep in memory alongside jobs."""
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
 def _submit_job(
     path: str, payload: dict[str, Any], fmt: str, key: str, budget: int | None
 ) -> dict[str, Any]:
@@ -643,6 +648,8 @@ def _submit_job(
         "status": "running",
         "created": time.time(),
         "url": payload.get("url", ""),
+        # On a shared HTTP server, a job is only pollable by the caller who paid for it.
+        "key_fingerprint": _key_fingerprint(key),
         "result": None,
         "error": None,
     }
@@ -889,7 +896,9 @@ async def check_scrape(
     not stuck. The finished result is returned in full.
     """
     record = _JOBS.get(job_id)
-    if record is None:
+    # A wrong key gets the same answer as an unknown id: a job belongs to the caller who
+    # paid for it, and a distinct error would confirm the id exists to everyone else.
+    if record is None or record["key_fingerprint"] != _key_fingerprint(_api_key()):
         raise ApiError(
             f"No job {job_id!r}. Either it expired (results are kept for "
             f"{JOB_TTL_SECONDS / 60:.0f} minutes), or the server restarted. Start it again."
