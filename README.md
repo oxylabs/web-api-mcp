@@ -8,14 +8,13 @@ any MCP-capable agent live web access through the Oxylabs Web API.
 | Tool | What it does |
 |---|---|
 | `search` | Search the live web, returns ranked organic results (title, description, URL) |
-| `scrape` | Read a single URL as **Markdown** by default, including JS-heavy and bot-protected pages |
-| `extract` | Pull named fields off a page as JSON, no selectors. Billed above a scrape, so the user approves each run |
-| `check_scrape` | Collect the result of a JavaScript-rendering job |
+| `scrape` | Read a single URL as **Markdown** by default, including JS-heavy and bot-protected pages. Ask for a screenshot, or pass `extract` to pull named fields off it as JSON |
+| `check_scrape` | Collect the result of a scrape the API is running in the background |
 | `read_scraped` | Read a large page that was offloaded to disk, in chunks |
 | `list_scrapers` | List the scrape endpoints the API implements, or describe one's parameters |
 | `scrape_target` | Call a target-specific scrape endpoint with its own parameters |
 
-All seven are annotated `readOnlyHint` — nothing here writes anything — so clients can run
+All six are annotated `readOnlyHint` — nothing here writes anything — so clients can run
 them without prompting.
 
 ## The skill ships with the server
@@ -46,17 +45,18 @@ that knows its own limit can override it per request with an `X-MCP-Max-Tokens` 
 ## JavaScript rendering is a job, not a wait
 
 `run_js` pages take 30-150 seconds and routinely outlive a tool call. So `scrape(url,
-run_js=True)` (and `extract`, and `scrape_target` with `run_js` in its params) returns a job
-id straight away:
+run_js=True)` (and screenshots, and `scrape_target` with `run_js` in its params or an
+`async/...` endpoint) is sent to the API's own queue at `/v1/async/...`, which answers
+straight away:
 
 ```json
-{ "job_id": "9f3c1a20b7d4", "status": "running", "url": "https://example.com" }
+{ "status": "pending", "request_id": "7504857924934611969", "note": "Queued. … call check_scrape('7504857924934611969') …" }
 ```
 
-The agent polls `check_scrape(job_id)` — after ~30s, then every ~10s — and does other work
-in between. Each reply carries `elapsed_seconds` and says whether the job is still inside
-the normal 150s window, so a slow render doesn't read as a stuck one. Results are kept for
-`OXYLABS_JOB_TTL_MINUTES` (default 60), long after the job itself has finished.
+The agent polls `check_scrape(request_id)` — after ~30s, then every ~10s — and does other
+work in between. A pending reply says a slow render is normal, so it doesn't read as a stuck
+one. The API holds the result, so nothing about a job lives in this process: restarts and
+extra replicas do not lose it.
 
 ### It says when a page needed rendering
 
@@ -79,12 +79,9 @@ HTML is measured on its text, not its markup, so a 3 KB shell of `<meta>` tags s
 as thin. The flag is a hint, not a retry: rendering is slow and billed, and a genuinely
 short page would pay for it on every fetch. The threshold is 500 visible characters.
 
-Jobs live in the server process: they do not survive a restart, and they are not shared
-between HTTP replicas. Run one replica, or give it sticky sessions.
-
 ## Structured extraction costs extra
 
-`extract(url, prompt)` returns the fields you name as JSON instead of a page to read. The
+`scrape(url, extract="…")` returns the fields you name as JSON instead of a page to read. The
 page is parsed by a model per call, which is billed above a plain `scrape`, so the server
 asks the user to approve each run over MCP elicitation. Clients that can't elicit get an
 error explaining why rather than a silent charge; `OXYLABS_EXTRACT_APPROVAL=0` waives the
@@ -193,7 +190,6 @@ docker run --rm -p 8080:8080 \
 | `OXYLABS_TIMEOUT` | `120` | Per-request timeout in seconds |
 | `OXYLABS_RETRIES` | `2` | Retries on a transient 429/500/502/503/504 |
 | `OXYLABS_RATE_LIMIT` | *(off)* | Cap this server's own spend, e.g. `100/1h`, `50/30m` |
-| `OXYLABS_JOB_TTL_MINUTES` | `60` | How long a finished job's result stays pollable |
 | `OXYLABS_EXTRACT_APPROVAL` | `1` | Set to `0` to skip the user prompt on `extract` |
 | `OXYLABS_MAX_INLINE_TOKENS` | `10000` | Above this, content is offloaded or truncated |
 | `OXYLABS_SPILL_DIR` | system temp | Where offloaded pages are written (stdio only) |
@@ -237,7 +233,7 @@ pytest                         # or: python tests/test_server.py
 ```
 
 The tests are offline: error parsing, input validation, envelope trimming, endpoint-name
-handling, the job lifecycle and the `extract` approval gate. CI runs the same on 3.10,
+handling, queueing and polling, and the `extract` approval gate. CI runs the same on 3.10,
 3.12 and 3.13.
 
 ## License

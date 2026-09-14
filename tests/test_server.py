@@ -6,7 +6,6 @@ Run: python tests/test_server.py   (or: pytest)
 import asyncio
 import os
 import sys
-import time
 
 import httpx
 
@@ -18,7 +17,6 @@ from oxylabs_web_api_mcp.server import (  # noqa: E402
     ApiError,
     _detail,
     check_scrape,
-    extract,
     read_scraped,
     scrape,
     scrape_target,
@@ -224,119 +222,86 @@ def test_endpoint_names_cannot_walk_the_path():
         raise AssertionError(f"_endpoint_name must refuse {bad!r}")
 
 
-def _run_js_job(call):
-    """Run a run_js tool call against a stubbed API and poll it to completion."""
+def _queued(call):
+    """Run a run_js tool call against a stubbed API and return (payload sent, path, result)."""
+    seen = {}
 
     async def fake_request(method, path, payload=None, **kwargs):
-        return {"results": [{"markdown": "rendered"}], "params": payload}
+        seen.update(method=method, path=path, payload=payload)
+        return {
+            "status": "pending",
+            "params": payload,
+            "metadata": {"request_id": "7500000000000000001"},
+        }
 
     real = srv._request
     srv._request = fake_request
     try:
-        started = asyncio.run(call())
-        assert started["status"] == "running" and started["job_id"], started
-
-        async def drain():
-            await srv._JOBS[started["job_id"]]["task"]
-            return await check_scrape(started["job_id"])
-
-        return started, asyncio.run(drain())
+        return seen, asyncio.run(call())
     finally:
         srv._request = real
 
 
-def test_run_js_returns_a_job_to_poll_and_then_the_content():
-    started, done = _run_js_job(lambda: scrape("https://ex.com", run_js=True))
-    assert "check_scrape" in started["note"]
-    assert done["status"] == "done"
-    assert done["result"]["results"][0]["markdown"] == "rendered", done
-    # The envelope echo is gone by the time the agent sees it.
-    assert "params" not in done["result"]
+def test_run_js_is_queued_upstream_and_returns_the_request_id():
+    seen, out = _queued(lambda: scrape("https://ex.com", run_js=True))
+    assert (seen["method"], seen["path"]) == ("POST", "/v1/async/scrape"), seen
+    assert seen["payload"]["run_js"] is True
+    assert out["status"] == "pending" and out["request_id"] == "7500000000000000001"
+    assert "check_scrape('7500000000000000001')" in out["note"]
+    assert "params" not in out and "metadata" not in out
 
 
-def test_scrape_target_routes_run_js_through_the_same_job_path():
-    started, done = _run_js_job(
-        lambda: scrape_target("amazon_search", {"url": "https://ex.com", "run_js": True})
-    )
-    assert done["status"] == "done" and started["status"] == "running"
+def test_scrape_target_queues_run_js_and_async_endpoints_the_same_way():
+    seen, _ = _queued(lambda: scrape_target("scrape/amazon/search", {"query": "x", "run_js": True}))
+    assert seen["path"] == "/v1/async/scrape/amazon/search"
+    seen, out = _queued(lambda: scrape_target("async/scrape/chatgpt", {"prompt": "hi"}))
+    assert seen["path"] == "/v1/async/scrape/chatgpt"
+    assert "check_scrape('7500000000000000001')" in out["note"]
 
 
-def test_check_scrape_reports_a_failed_job_instead_of_hanging():
-    async def failing(method, path, payload=None, **kwargs):
-        raise ApiError("upstream exploded")
+def test_check_scrape_polls_the_api_for_the_request_id():
+    calls = []
 
-    real = srv._request
-    srv._request = failing
-    try:
-        started = asyncio.run(scrape("https://ex.com", run_js=True))
-
-        async def drain():
-            await srv._JOBS[started["job_id"]]["task"]
-            return await check_scrape(started["job_id"])
-
-        try:
-            asyncio.run(drain())
-        except ApiError as exc:
-            assert "upstream exploded" in str(exc), exc
-        else:
-            raise AssertionError("a failed job must surface as an error, not a result")
-    finally:
-        srv._request = real
-
-
-def test_a_slow_render_is_not_reported_as_a_stuck_one():
-    """A job inside the 150s window must read as normal, past it as still-worth-polling.
-
-    The failure this guards is an agent abandoning a healthy render and starting over,
-    which doubles the bill and the wait.
-    """
-
-    def _running(age):
+    async def fake_request(method, path, payload=None, **kwargs):
+        calls.append((method, path))
+        if path.endswith("/111"):
+            return {"state": "pending"}  # the async API's current spelling
+        if path.endswith("/222"):
+            return {"status": "pending", "results": []}  # the spelling before 2026-09-14
+        if path.endswith("/404404"):
+            raise ApiError(f"{path} returned 404: Query not found.")
         return {
-            "status": "running",
-            "created": time.time() - age,
-            "url": "https://ex.com",
-            "key_fingerprint": srv._key_fingerprint("test-key"),
-            "result": None,
-            "error": None,
+            "status": "done",
+            "results": [{"markdown": "answer"}],
+            "params": {"output": ["markdown"]},
+            "metadata": {"request_id": "7504857924934611969"},
         }
 
-    srv._JOBS["slow"] = _running(90)
-    srv._JOBS["late"] = _running(srv.JS_RENDER_MAX_SECONDS + 60)
+    real = srv._request
+    srv._request = fake_request
     try:
-        slow = asyncio.run(check_scrape("slow"))
-        assert slow["elapsed_seconds"] >= 90, slow
-        assert "normal" in slow["note"] and str(srv.JS_RENDER_MAX_SECONDS) in slow["note"], slow
+        for rid in ("111", "222"):
+            pending = asyncio.run(check_scrape(rid))
+            assert pending["status"] == "pending" and "poll again" in pending["note"], pending
 
-        late = asyncio.run(check_scrape("late"))
-        assert f"past the {srv.JS_RENDER_MAX_SECONDS}s" in late["note"], late
-        # Past the ceiling it still says to poll, not to restart: the server waits longer.
-        assert "poll again" in late["note"], late
+        done = asyncio.run(check_scrape("7504857924934611969"))
+        assert done["status"] == "done"
+        assert done["result"]["results"][0]["markdown"] == "answer"
+        assert done["result"]["request_id"] == "7504857924934611969"
+        assert "params" not in done["result"]
+        assert calls[-1] == ("GET", "/v1/async/scrape/7504857924934611969")
+
+        for bad in ("nothex", "404404"):
+            try:
+                asyncio.run(check_scrape(bad))
+            except ApiError as exc:
+                assert "No job" in str(exc) or "not a request id" in str(exc), exc
+            else:
+                raise AssertionError(f"{bad!r} must surface as an unknown job")
+        # The non-numeric id never reached the API; the 404 one did, once.
+        assert len(calls) == 4
     finally:
-        srv._JOBS.pop("slow", None)
-        srv._JOBS.pop("late", None)
-
-
-def test_check_scrape_rejects_an_unknown_job():
-    try:
-        asyncio.run(check_scrape("nope"))
-    except ApiError:
-        return
-    raise AssertionError("expected ApiError for an unknown job id")
-
-
-def test_jobs_are_bound_to_the_key_that_started_them():
-    started, done = _run_js_job(lambda: scrape("https://ex.com", run_js=True))
-    assert done["status"] == "done"
-    # A different bearer key gets the same answer as an unknown id — a job result
-    # belongs to the caller who paid for it, and no oracle confirms the id exists.
-    with _headers({"authorization": "Bearer someone-elses-key"}):
-        try:
-            asyncio.run(check_scrape(started["job_id"]))
-        except ApiError as exc:
-            assert "No job" in str(exc), exc
-        else:
-            raise AssertionError("a job must not be pollable with a different key")
+        srv._request = real
 
 
 def test_extract_needs_the_user_to_approve_the_extra_cost():
@@ -352,9 +317,9 @@ def test_extract_needs_the_user_to_approve_the_extra_cost():
         # Declined: nothing is billed.
         try:
             asyncio.run(
-                extract(
+                scrape(
                     "https://ex.com",
-                    "the title",
+                    extract="the title",
                     ctx=_FakeCtx(elicitation={}, answer=("decline", False)),
                 )
             )
@@ -366,7 +331,7 @@ def test_extract_needs_the_user_to_approve_the_extra_cost():
 
         # A client that cannot ask is refused rather than billed silently.
         try:
-            asyncio.run(extract("https://ex.com", "the title", ctx=_FakeCtx()))
+            asyncio.run(scrape("https://ex.com", extract="the title", ctx=_FakeCtx()))
         except ApiError as exc:
             assert "elicitation" in str(exc), exc
         else:
@@ -377,8 +342,10 @@ def test_extract_needs_the_user_to_approve_the_extra_cost():
         # NOT also ask for "json" — that runs the built-in parser, and both deliver under
         # the same `json` result key, contending for it.
         out = asyncio.run(
-            extract(
-                "https://ex.com", "the title", ctx=_FakeCtx(elicitation={}, answer=("accept", True))
+            scrape(
+                "https://ex.com",
+                extract="the title",
+                ctx=_FakeCtx(elicitation={}, answer=("accept", True)),
             )
         )
         assert calls[0]["json"] == {"prompt": "the title"}, calls
@@ -396,7 +363,7 @@ def test_extract_approval_can_be_waived_by_the_operator():
     srv._request = fake_request
     os.environ["OXYLABS_EXTRACT_APPROVAL"] = "0"
     try:
-        asyncio.run(extract("https://ex.com", "the title"))
+        asyncio.run(scrape("https://ex.com", extract="the title"))
     finally:
         srv._request = real
         del os.environ["OXYLABS_EXTRACT_APPROVAL"]
@@ -771,3 +738,35 @@ if __name__ == "__main__":
             fn()
             print(f"ok  {name}")
     print("all checks passed")
+
+
+def test_screenshot_comes_back_as_an_image_not_base64_text():
+    """`format="screenshot"` forces run_js (the API demands it) and the PNG is an image block."""
+    import base64
+
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+    seen = {}
+
+    async def fake_request(method, path, payload=None, **kwargs):
+        if method == "POST":
+            seen.update(payload)
+            return {"status": "pending", "metadata": {"request_id": "77"}}
+        return {
+            "status": "done",
+            "results": [{"screenshot": base64.b64encode(png).decode(), "markdown": None}],
+            "params": {"output": ["screenshot"]},
+        }
+
+    real = srv._request
+    srv._request = fake_request
+    try:
+        started = asyncio.run(scrape("https://ex.com", format="screenshot"))
+        assert started["status"] == "pending" and seen["run_js"] is True
+        out = asyncio.run(check_scrape(started["request_id"]))
+    finally:
+        srv._request = real
+    assert isinstance(out, list) and len(out) == 2, out
+    envelope, image = out
+    assert isinstance(image, srv.Image) and image.data == png
+    shot = envelope["result"]["results"][0]["screenshot"]
+    assert shot["bytes"] == len(png) and "note" in shot
