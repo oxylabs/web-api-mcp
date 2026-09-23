@@ -199,14 +199,14 @@ integrating the API into an application.
 | `max_results` | integer, 1–20 | Default 10. |
 | `location` | string | Geo context, max 256 chars, e.g. `"Germany"`, `"New York,New York,United States"`. |
 
-Returns `results[]` with `title`, `shortDescription`, `url`, `metadata.position`, plus
+Returns `results[]` with `title`, `short_description`, `url`, `metadata.position`, plus
 `related_searches[]` (`query`, `link`) and `related_questions[]` (`question`, plus nullable
 `title`, `link`, `snippet`). None of the three arrays is guaranteed present — absent means
 the same as empty, so read them as "array or `[]`". `status` is `done` or `faulted`; check
 it, because `faulted` can arrive with a `2xx`.
 
 **Descriptions are search snippets, not page content.** Never answer a factual question
-from `shortDescription` alone — it is truncated and often stale. Scrape the source.
+from `short_description` alone — it is truncated and often stale. Scrape the source.
 
 ### Scrape — `POST /v1/scrape`
 
