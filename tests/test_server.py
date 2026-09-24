@@ -673,6 +673,46 @@ def test_backoff_is_jittered_so_callers_do_not_retry_in_lockstep():
         httpx.AsyncClient, srv.random.uniform = real_client, real_uniform
 
 
+def test_a_spent_quota_is_not_retried():
+    calls = []
+
+    def spent(method, url):
+        calls.append(url)
+        return httpx.Response(
+            429,
+            json={"status": 429, "title": "QUOTA_EXCEEDED", "detail": "Upgrade your plan."},
+            request=httpx.Request(method, url),
+        )
+
+    real_client = httpx.AsyncClient
+    httpx.AsyncClient = _stub_client(spent)
+    try:
+        asyncio.run(srv._request("POST", "/v1/search", {"query": "x"}))
+    except ApiError as exc:
+        assert len(calls) == 1, "backoff cannot refill a quota"
+        assert "quota" in str(exc).lower() and "retrying will not help" in str(exc), exc
+    else:
+        raise AssertionError("expected ApiError for a spent quota")
+    finally:
+        httpx.AsyncClient = real_client
+
+
+def test_search_validation_errors_name_the_field():
+    problem = {
+        "status": 400,
+        "title": "VALIDATION_ERROR",
+        "detail": "1 request field is invalid; fix every entry in `errors` and resend.",
+        "errors": [
+            {
+                "pointer": "#/location",
+                "detail": "location must be an ISO 3166-1 alpha-2 country code",
+            }
+        ],
+    }
+    resp = httpx.Response(400, json=problem, request=httpx.Request("POST", "http://x/v1/search"))
+    assert srv._detail(resp) == "#/location: location must be an ISO 3166-1 alpha-2 country code"
+
+
 def test_a_2xx_carrying_faulted_is_not_treated_as_success():
     stub = _stub_client(
         lambda m, u: httpx.Response(
@@ -684,7 +724,7 @@ def test_a_2xx_carrying_faulted_is_not_treated_as_success():
     real_client = httpx.AsyncClient
     httpx.AsyncClient = stub
     try:
-        asyncio.run(srv._request("POST", "/v1/search", {"query": "x"}))
+        asyncio.run(srv._request("POST", "/v1/scrape", {"url": "https://example.com"}))
     except ApiError as exc:
         assert "faulted" in str(exc) and "req-42" in str(exc), exc
     else:
