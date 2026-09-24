@@ -280,6 +280,12 @@ def _detail(resp: httpx.Response) -> str:
     except ValueError:
         return resp.text[:500]
     if isinstance(body, dict):
+        # Search answers RFC 9457 with per-field `errors`; scrape validation carries `extra`.
+        errors = body.get("errors")
+        if isinstance(errors, list) and errors:
+            return "; ".join(
+                f"{e.get('pointer')}: {e.get('detail')}" for e in errors if isinstance(e, dict)
+            )
         # Validation errors carry `extra`; gateway errors carry `message`. `extra` is
         # typed object|array|null upstream, so a list is the common case, not the only one.
         problems = body.get("extra")
@@ -293,9 +299,25 @@ def _detail(resp: httpx.Response) -> str:
     return str(body)[:500]
 
 
+def _quota_spent(resp: httpx.Response) -> bool:
+    """A 429 whose problem title says the plan is spent; backoff cannot clear it."""
+    if resp.status_code != 429:
+        return False
+    try:
+        body = resp.json()
+    except ValueError:
+        return False
+    return isinstance(body, dict) and body.get("title") == "QUOTA_EXCEEDED"
+
+
 def _check(resp: httpx.Response, path: str) -> dict[str, Any]:
     if resp.status_code == 401:
         raise ApiError("Authentication failed (401). Check the API key.")
+    if _quota_spent(resp):
+        raise ApiError(
+            "Quota exceeded (429): the plan's quota is spent. Stop and tell the user to "
+            "check their plan in the Oxylabs dashboard; retrying will not help."
+        )
     if resp.status_code == 429:
         # Reached only once the retries above are spent: backoff did not clear it, so this
         # is a quota problem for the human, not something to keep hammering.
@@ -415,7 +437,7 @@ async def _request(
             last_error = ApiError(f"Could not reach the Oxylabs Web API at {BASE_URL}{path}: {exc}")
             continue
 
-        if resp.status_code in RETRY_STATUS and attempt < RETRIES:
+        if resp.status_code in RETRY_STATUS and attempt < RETRIES and not _quota_spent(resp):
             last_error = ApiError(f"{path} returned {resp.status_code}: {_detail(resp)}")
             continue
         return _check(resp, path)
@@ -697,12 +719,11 @@ async def search(
         str | None,
         Field(
             description=(
-                "Geographic context for the search, from a country to a full locality. "
-                "Pass it whenever the answer is geographic — an unrecognised value is not "
-                "validated upstream and silently falls back to the default geo."
+                "ISO 3166-1 alpha-2 country code to rank results for. Pass it whenever the "
+                'answer is geographic. A place name such as "Germany" is rejected.'
             ),
-            examples=["Germany", "New York,New York,United States"],
-            max_length=256,
+            examples=["DE", "US", "LT"],
+            pattern="^[A-Za-z]{2}$",
         ),
     ] = None,
     ctx: Context | None = None,
