@@ -56,11 +56,6 @@ The agent polls `check_scrape(request_id)` every 5s while it is pending. The API
 result, so nothing about a request lives in this process: restarts and extra replicas do not
 lose it.
 
-### Faulted requests say why
-
-A faulted request comes back as an error with its `title`/`detail` and request id. Faulted
-requests are not charged, so retrying costs nothing.
-
 ### It says when a page needed rendering
 
 The agent shouldn't have to guess whether an empty page is empty or just unrendered, and it
@@ -82,33 +77,19 @@ HTML is measured on its text, not its markup, so a 3 KB shell of `<meta>` tags s
 as thin. The flag is a hint, not a retry: rendering is slow and billed, and a genuinely
 short page would pay for it on every fetch. The threshold is 500 visible characters.
 
-## Structured data: dedicated parser first, AI parser second
+## Structured data
 
-The API has two parsers behind `output: ["json"]`:
+Request structured data and the server selects the parser for you:
 
-- **Dedicated parser** — sent as `output: ["json"]` with no `json` field. Available on select
-  endpoints, and returns that endpoint's own predefined structure: search results (organic
-  links, ads, images, news, videos, SERP extras), product listings and details (title,
-  price, stock, seller, reviews), seller profiles, bestsellers, hotel offers, AI chat answers
-  (prompt, response, citations), YouTube video and channel metadata. It cannot be steered.
-- **AI parser** — sent as `output: ["json"]` with `json: {"prompt": …}` and/or
-  `json: {"schema": …}`. Available on most endpoints, and returns what you describe.
+- **Dedicated parser** — included at no extra cost. Available on selected target endpoints,
+  it returns that endpoint's predefined structure.
+- **AI parser** — billed on top of the scrape. Available on most endpoints, it returns
+  exactly the fields your prompt or schema describes.
 
-Which endpoint offers which comes from `GET /v1/scrapers?group_by=json_output_support`
-(cached per key for an hour): `json_supported` endpoints have both, the
-`json_supported_only_with_prompt_or_schema` ones only the AI parser, and `json_not_supported`
-ones return no JSON.
-
-When structured data is asked for — `scrape(url, json_prompt=…)`, or `scrape_target(endpoint,
-params, structured=True, json_prompt=…)` — the server tries the dedicated parser first where
-there is one, and falls back to the AI parser when there is none, or when it failed — a
-`PARSE_FAILED*` / `PARSE_NOT_SUPPORTED` verdict in `metadata.statuses.json_parse`, a request
-faulted with a `PARSE_*` error, or no parsed content at all. Other verdicts, such as
-`PARSE_PARTIAL_SUCCESS_SOME_FIELDS_DEFAULT`, are returned as they are, quoted in `parser_note`.
-Results carry `parser: "dedicated" | "ai"`; if a dedicated result lacks the fields the agent
-needs, it calls again with `parser="ai"`. The generic `/v1/scrape` URL endpoint has only the
-AI parser, so `scrape(url, json_prompt=…)` always uses it. A queued request can't fall back by
-itself; `check_scrape` labels its result with the same `parser` and `parser_note`.
+To keep costs down, the server tries the dedicated parser first and falls back to the AI
+parser only when the endpoint has no dedicated parser or the dedicated parse fails. Each
+result states which parser produced it, and the agent can request the AI parser directly
+when a dedicated result lacks the fields it needs.
 
 ## Large pages
 
