@@ -8,11 +8,11 @@ any MCP-capable agent live web access through the Oxylabs Web API.
 | Tool | What it does |
 |---|---|
 | `search` | Search the live web, returns ranked organic results (title, description, URL) |
-| `scrape` | Read a single URL as **Markdown** by default, including JS-heavy and bot-protected pages. Ask for a screenshot, or pass `extract` to pull named fields off it as JSON |
+| `scrape` | Read a single URL as **Markdown** by default, including JS-heavy and bot-protected pages. Ask for a screenshot, or pass `json_prompt` / `json_schema` to pull named fields off it as JSON |
 | `check_scrape` | Collect the result of a scrape the API is running in the background |
 | `read_scraped` | Read a large page that was offloaded to disk, in chunks |
-| `list_scrapers` | List the scrape endpoints the API implements, or describe one's parameters |
-| `scrape_target` | Call a target-specific scrape endpoint with its own parameters |
+| `list_scrapers` | List the scrape endpoints the API implements, grouped by parser support, or describe one's parameters |
+| `scrape_target` | Call a target-specific scrape endpoint with its own parameters, as content or as structured JSON |
 
 All six are annotated `readOnlyHint` — nothing here writes anything — so clients can run
 them without prompting.
@@ -42,21 +42,24 @@ for that reason. The budget is `OXYLABS_MAX_INLINE_TOKENS` (default 10 000), and
 that knows its own limit can override it per request with an `X-MCP-Max-Tokens` header —
 `0` opts out entirely.
 
-## JavaScript rendering is a job, not a wait
+## Sync first, queued only on a timeout
 
-`run_js` pages take 30-150 seconds and routinely outlive a tool call. So `scrape(url,
-run_js=True)` (and screenshots, and `scrape_target` with `run_js` in its params or an
-`async/...` endpoint) is sent to the API's own queue at `/v1/async/...`, which answers
-straight away:
+Every scrape goes to the synchronous endpoint first. If it times out, the same request is
+sent to the corresponding asynchronous endpoint (`/v1/async/...`) and the agent gets a request id to poll.
+`async/...` endpoints passed to `scrape_target` are always queued.
 
 ```json
-{ "status": "pending", "request_id": "7504857924934611969", "note": "Queued. … call check_scrape('7504857924934611969') …" }
+{ "state": "pending", "request_id": "7504857924934611969", "note": "The synchronous call timed out (…), so the same request was queued instead. … call check_scrape('7504857924934611969') …" }
 ```
 
-The agent polls `check_scrape(request_id)` — after ~30s, then every ~10s — and does other
-work in between. A pending reply says a slow render is normal, so it doesn't read as a stuck
-one. The API holds the result, so nothing about a job lives in this process: restarts and
-extra replicas do not lose it.
+The agent polls `check_scrape(request_id)` every 5s while it is pending. The API holds the
+result, so nothing about a request lives in this process: restarts and extra replicas do not
+lose it.
+
+### Faulted requests say why
+
+A faulted request comes back as an error with its `title`/`detail` and request id. Faulted
+requests are not charged, so retrying costs nothing.
 
 ### It says when a page needed rendering
 
@@ -79,13 +82,33 @@ HTML is measured on its text, not its markup, so a 3 KB shell of `<meta>` tags s
 as thin. The flag is a hint, not a retry: rendering is slow and billed, and a genuinely
 short page would pay for it on every fetch. The threshold is 500 visible characters.
 
-## Structured extraction costs extra
+## Structured data: dedicated parser first, AI parser second
 
-`scrape(url, extract="…")` returns the fields you name as JSON instead of a page to read. The
-page is parsed by a model per call, which is billed above a plain `scrape`, so the server
-asks the user to approve each run over MCP elicitation. Clients that can't elicit get an
-error explaining why rather than a silent charge; `OXYLABS_EXTRACT_APPROVAL=0` waives the
-prompt once the user has agreed to the cost.
+The API has two parsers behind `output: ["json"]`:
+
+- **Dedicated parser** — sent as `output: ["json"]` with no `json` field. Available on select
+  endpoints, and returns that endpoint's own predefined structure: search results (organic
+  links, ads, images, news, videos, SERP extras), product listings and details (title,
+  price, stock, seller, reviews), seller profiles, bestsellers, hotel offers, AI chat answers
+  (prompt, response, citations), YouTube video and channel metadata. It cannot be steered.
+- **AI parser** — sent as `output: ["json"]` with `json: {"prompt": …}` and/or
+  `json: {"schema": …}`. Available on most endpoints, and returns what you describe.
+
+Which endpoint offers which comes from `GET /v1/scrapers?group_by=json_output_support`
+(cached per key for an hour): `json_supported` endpoints have both, the
+`json_supported_only_with_prompt_or_schema` ones only the AI parser, and `json_not_supported`
+ones return no JSON.
+
+When structured data is asked for — `scrape(url, json_prompt=…)`, or `scrape_target(endpoint,
+params, structured=True, json_prompt=…)` — the server tries the dedicated parser first where
+there is one, and falls back to the AI parser when there is none, or when it failed — a
+`PARSE_FAILED*` / `PARSE_NOT_SUPPORTED` verdict in `metadata.statuses.json_parse`, a request
+faulted with a `PARSE_*` error, or no parsed content at all. Other verdicts, such as
+`PARSE_PARTIAL_SUCCESS_SOME_FIELDS_DEFAULT`, are returned as they are, quoted in `parser_note`.
+Results carry `parser: "dedicated" | "ai"`; if a dedicated result lacks the fields the agent
+needs, it calls again with `parser="ai"`. The generic `/v1/scrape` URL endpoint has only the
+AI parser, so `scrape(url, json_prompt=…)` always uses it. A queued request can't fall back by
+itself; `check_scrape` labels its result with the same `parser` and `parser_note`.
 
 ## Large pages
 
@@ -186,11 +209,9 @@ docker run --rm -p 8080:8080 \
 | Variable | Default | Purpose |
 |---|---|---|
 | `OXYLABS_WEB_API_KEY` | *(required on stdio)* | Web API key, sent as `Authorization: Bearer <key>`. Over HTTP a per-request `Authorization: Bearer` header takes precedence |
-| `OXYLABS_BASE_URL` | `https://webapi.oxylabs.io` | Override for staging or a proxy |
-| `OXYLABS_TIMEOUT` | `120` | Per-request timeout in seconds |
+| `OXYLABS_BASE_URL` | `https://webapi.oxylabs.io` | Override the API base URL, e.g. to go through a proxy |
 | `OXYLABS_RETRIES` | `2` | Retries on a transient 429/500/502/503/504 |
 | `OXYLABS_RATE_LIMIT` | *(off)* | Cap this server's own spend, e.g. `100/1h`, `50/30m` |
-| `OXYLABS_EXTRACT_APPROVAL` | `1` | Set to `0` to skip the user prompt on `extract` |
 | `OXYLABS_MAX_INLINE_TOKENS` | `10000` | Above this, content is offloaded or truncated |
 | `OXYLABS_SPILL_DIR` | system temp | Where offloaded pages are written (stdio only) |
 | `OXYLABS_SPILL` | `1` | Set to `0` to keep everything inline even on stdio |
@@ -233,7 +254,8 @@ pytest                         # or: python tests/test_server.py
 ```
 
 The tests are offline: error parsing, input validation, envelope trimming, endpoint-name
-handling, queueing and polling, and the `extract` approval gate. CI runs the same on 3.10,
+handling, sync-first scraping with the queued fallback and polling, and the dedicated/AI
+parser selection. CI runs the same on 3.10,
 3.12 and 3.13.
 
 ## License
