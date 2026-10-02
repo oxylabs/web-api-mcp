@@ -1233,3 +1233,48 @@ def test_screenshot_comes_back_as_an_image_not_base64_text():
         srv._request = real
     envelope, image = out
     assert image.data == png and envelope["result"]["results"][0]["screenshot"]["bytes"] == len(png)
+
+
+def test_a_target_scrape_without_output_budgets_the_format_the_api_picked():
+    srv._SPILL_ENABLED = False
+    size = srv.MAX_INLINE_TOKENS * 4 + 5000
+
+    def html_default(payload):
+        return _done({**payload, "output": ["html"]}, html="<p>" + "x" * size + "</p>")
+
+    with _api(html_default):
+        out = asyncio.run(scrape_target("scrape/amazon/product", {"query": "B0"}))
+    result = out["results"][0]
+    assert "content_truncated" in result, result.keys()
+    assert len(result["html"]) < size
+
+
+def test_a_permanent_fault_does_not_invite_a_retry():
+    for tag in ("REQUEST_FAILED_BROWSER_INSTRUCTIONS", "DOWNLOAD_FAILED_VIDEO_PRIVATE"):
+        exc = srv._faulted({"title": tag, "detail": "d", "state": "faulted"}, "/v1/scrape", 500)
+        assert "will not change" in str(exc) and "costs nothing" not in str(exc), exc
+    exc = srv._faulted(
+        {"title": "REQUEST_FAILED_AFTER_TOO_MANY_RETRIES", "state": "faulted"}, "/v1/scrape", 500
+    )
+    assert "costs nothing" in str(exc), exc
+
+
+def test_a_401_carries_the_apis_reason():
+    resp = httpx.Response(
+        401,
+        json={"status": 401, "title": "UNAUTHORIZED", "detail": "Invalid authorization header."},
+        request=httpx.Request("POST", "https://x/v1/scrape"),
+    )
+    try:
+        srv._check(resp, "/v1/scrape")
+    except ApiError as exc:
+        assert "Invalid authorization header." in str(exc), exc
+    else:
+        raise AssertionError("expected ApiError for a 401")
+    bare = httpx.Response(401, text="", request=httpx.Request("POST", "https://x/v1/scrape"))
+    try:
+        srv._check(bare, "/v1/scrape")
+    except ApiError as exc:
+        assert str(exc) == "Authentication failed (401). Check the API key.", exc
+    else:
+        raise AssertionError("expected ApiError for a 401")
