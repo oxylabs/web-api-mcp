@@ -1228,8 +1228,8 @@ async def list_scrapers(
         str | None,
         Field(
             description=(
-                "Name a scrape endpoint to get its parameters and their types instead of "
-                "the list. Omit it to list what exists."
+                "Name a scrape endpoint to get the JSON Schema of its request body instead "
+                "of the list. Omit it to list what exists."
             ),
             examples=["scrape/amazon/search"],
         ),
@@ -1243,16 +1243,17 @@ async def list_scrapers(
     AI parser, `json_not_supported` ones return no JSON at all.
 
     Call this before assuming a dedicated scraper does or does not exist for a target,
-    then call it again with the endpoint name to see what that endpoint accepts. That is
-    the authoritative parameter list — more current than any documentation. Run the
-    endpoint itself with `scrape_target`.
+    then call it again with the endpoint name to get the JSON Schema of what that endpoint
+    accepts: types, `required`, `enum` values and defaults. That is the authoritative
+    parameter list — more current than any documentation. Run the endpoint itself with
+    `scrape_target`.
     """
     if endpoint is None:
         return await _request("GET", "/v1/scrapers?group_by=json_output_support", ctx=ctx)
 
     name = _endpoint_name(endpoint)
     await _note(ctx, f"Describing /v1/{name}")
-    return await _request("OPTIONS", f"/v1/{name}", ctx=ctx)
+    return await _request("OPTIONS", f"/v1/{name}?format=json_schema", ctx=ctx)
 
 
 @mcp.tool(annotations=_network_read("Call a target scraper"), output_schema=None)
@@ -1270,8 +1271,8 @@ async def scrape_target(
         dict[str, Any],
         Field(
             description=(
-                "The endpoint's own request body. Get the accepted keys and types from "
-                "`list_scrapers(endpoint)` rather than guessing them."
+                "The endpoint's own request body. Get its JSON Schema from "
+                "`list_scrapers(endpoint)` rather than guessing the keys."
             )
         ),
     ],
