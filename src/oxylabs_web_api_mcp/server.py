@@ -82,6 +82,17 @@ PREVIEW_CHARS = 2000
 
 RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
 TIMEOUT_TITLES = frozenset({"REQUEST_FAILED_SCRAPE_TIMEOUT"})
+PERMANENT_FAULTS = frozenset(
+    {
+        "REQUEST_FAILED_BROWSER_INSTRUCTIONS",
+        "REQUEST_FAILED_RESPONSE_TOO_BIG",
+        "PARSE_NOT_SUPPORTED",
+        "PARSE_FAILED_PRODUCT_NOT_FOUND",
+        "PARSE_FAILED_INVALID_PARSING_INSTRUCTIONS",
+        "PARSE_FAILED_PRESET_NOT_FOUND",
+    }
+)
+PERMANENT_FAULT_PREFIXES = ("DOWNLOAD_FAILED_",)
 RETRIES = int(os.environ.get("OXYLABS_RETRIES", "2"))
 RETRY_BASE_DELAY = 1.0
 
@@ -326,8 +337,12 @@ def _quota_spent(resp: httpx.Response) -> bool:
 
 
 def _check(resp: httpx.Response, path: str) -> dict[str, Any]:
+    body = _json_body(resp)
     if resp.status_code == 401:
-        raise ApiError("Authentication failed (401). Check the API key.")
+        reason = str((body or {}).get("detail") or (body or {}).get("message") or "").strip()
+        raise ApiError(
+            f"Authentication failed (401){f': {reason}' if reason else ''}. Check the API key."
+        )
     if _quota_spent(resp):
         raise ApiError(
             "Quota exceeded (429): the plan's quota is spent. Stop and tell the user to "
@@ -340,7 +355,6 @@ def _check(resp: httpx.Response, path: str) -> dict[str, Any]:
             "Rate limited (429) and still limited after backoff. Lower concurrency, or "
             "check the account's remaining quota in the Oxylabs dashboard."
         )
-    body = _json_body(resp)
     if _timed_out(body):
         raise ApiTimeout(f"{path} returned {resp.status_code}: {_detail(resp)}")
     # A faulted request is answered with an error status and `state: "faulted"`, next to the
@@ -374,10 +388,18 @@ def _faulted(body: dict[str, Any], path: str, status_code: int) -> ApiFaulted:
     details = str(body.get("detail") or "")
     request_id = (body.get("metadata") or {}).get("request_id")
     reason = ": ".join(part for part in (tag, details) if part) or "no reason given"
+    if tag in PERMANENT_FAULTS or tag.startswith(PERMANENT_FAULT_PREFIXES):
+        advice = (
+            "Retrying the same request will not change this: fix the parameters, try another "
+            "target, or report it to the user."
+        )
+    else:
+        advice = (
+            "Faulted requests are not charged, so retrying costs nothing; if it keeps failing, "
+            f"quote request_id {request_id or 'unknown'} to support."
+        )
     return ApiFaulted(
-        f'{path} returned {status_code} with state "faulted" ({reason}). Faulted requests are '
-        "not charged, so retrying costs nothing; if it keeps failing, quote request_id "
-        f"{request_id or 'unknown'} to support.",
+        f'{path} returned {status_code} with state "faulted" ({reason}). {advice}',
         tag=tag,
         params=body.get("params"),
     )
@@ -764,7 +786,12 @@ async def _scrape(
                 f"The synchronous call timed out ({exc}), so the same request was queued instead. "
             ),
         )
-    response = _process_content(response, _output_format(payload), _token_budget())
+
+    echoed = response.get("params")
+    fmt = _output_format(
+        echoed if isinstance(echoed, dict) and echoed.get(OUTPUT_PARAM) else payload
+    )
+    response = _process_content(response, fmt, _token_budget())
     return _pop_screenshots(_trim(_flag_thin_content(response)))
 
 
