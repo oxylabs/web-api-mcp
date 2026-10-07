@@ -1024,9 +1024,10 @@ async def search(
     than a global average. Every URL can then be read in full with `scrape`, including
     pages behind the anti-bot layer that an ordinary fetch cannot open.
 
-    Returns titles, short descriptions and URLs, not page content. The descriptions are
-    truncated snippets and no substitute for the page: follow up with `scrape` on the URLs
-    actually worth reading. Not for local files, git, or anything off the public web.
+    Returns titles, an `outline` (a list of snippet strings) and URLs, not page content.
+    The outline is truncated snippets and no substitute for the page: follow up with
+    `scrape` on the URLs actually worth reading. Not for local files, git, or anything off
+    the public web.
     """
     if not query.strip():
         raise ApiError("`query` must not be empty.")
