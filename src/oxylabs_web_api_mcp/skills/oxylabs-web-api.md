@@ -227,14 +227,14 @@ integrating the API into an application.
 | `max_results` | integer, 1–20 | Default 10. |
 | `location` | string | ISO 3166-1 alpha-2 country code, e.g. `"DE"`, case-insensitive. A place name such as `"Germany"` is a `400`. |
 
-Returns `results[]` with `title`, `short_description`, `url`, `metadata.position`, plus
+Returns `results[]` with `title`, `outline` (list of snippet strings), `url`, `metadata.position`, plus
 `related_searches[]` (`query`) and `related_questions[]` (`question`, plus nullable
 `title` and `snippet`), and `metadata.request_id`. All three arrays are always present,
 possibly empty. A `200` carries `state: "done"`. When the search fails, the call
 is a `500` with `state: "faulted"` — not charged, so retrying costs nothing.
 
-**Descriptions are search snippets, not page content.** Never answer a factual question
-from `short_description` alone — it is truncated and often stale. Scrape the source.
+**`outline` is search snippets, not page content.** Never answer a factual question
+from `outline` alone — the strings are truncated and often stale. Scrape the source.
 
 ### Scrape — `POST /v1/scrape`
 
