@@ -603,7 +603,7 @@ def _process_content(payload: dict[str, Any], fmt: str, budget: int | None) -> d
     No reformatting happens here — the API renders the requested format server-side.
     """
     results = payload.get("results")
-    if not isinstance(results, list) or budget is None or fmt == "screenshot":
+    if not isinstance(results, list) or fmt == "screenshot":
         return payload
 
     requested_url = str((payload.get("params") or {}).get("url") or "")
@@ -613,9 +613,21 @@ def _process_content(payload: dict[str, Any], fmt: str, budget: int | None) -> d
         content = result.get(fmt)
         if not isinstance(content, str):
             continue
+        # The API returns a PDF as the file itself (escaped, or base64 with run_js).
+        if content[:1024].lstrip("\ufeff \t\r\n").startswith(("%PDF-", "JVBERi0")):
+            result[fmt] = ""
+            result["content_binary"] = {
+                "total_chars": len(content),
+                "reason": "the URL is a PDF",
+                "note": (
+                    "The API returns a PDF as the file itself, not text, so there is nothing "
+                    "to read here. Get the PDF's text another way, or tell the user."
+                ),
+            }
+            continue
         # A token is never fewer than one byte, so anything this short cannot overflow;
         # skip the scan for the ordinary page.
-        if len(content) <= budget:
+        if budget is None or len(content) <= budget:
             continue
         if _estimate_tokens(content) > budget:
             _offload(result, content, _result_url(result) or requested_url, fmt, budget)
@@ -640,6 +652,9 @@ def _pop_screenshots(
             png = base64.b64decode(result["screenshot"], validate=True)
         except (ValueError, TypeError):
             continue  # Not what we expected; leave it for the agent to read as text.
+        if png.startswith(b"%PDF-"):  # run_js on a PDF URL puts the file here too
+            result["screenshot"] = {"bytes": len(png), "note": "The URL is a PDF, not a page."}
+            continue
         images.append(Image(data=png, format="png"))
         info: dict[str, Any] = {"bytes": len(png), "note": "Returned as an image block."}
         if _SPILL_ENABLED:
@@ -695,8 +710,12 @@ def _flag_thin_content(payload: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(result, dict):
             continue
         content = result.get(fmt)
-        # Offloaded content is, by definition, not thin.
-        if not isinstance(content, str) or "content_offloaded" in result:
+        # Offloaded content is, by definition, not thin; a PDF is already flagged.
+        if (
+            not isinstance(content, str)
+            or "content_offloaded" in result
+            or "content_binary" in result
+        ):
             continue
 
         text = _visible_text(content, fmt)
