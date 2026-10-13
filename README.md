@@ -2,7 +2,7 @@
 
 mcp-name: io.oxylabs/web-api-mcp
 
-A self-hostable [Model Context Protocol](https://modelcontextprotocol.io) server that gives
+Welcome to the official repository overview for Oxylabs' Web API MCP. This guide is a developer-focused, technical reference covering Web API MCP. A self-hostable [Model Context Protocol](https://modelcontextprotocol.io) server that gives
 any MCP-capable agent live web access through the Oxylabs Web API.
 
 | Tool | What it does |
@@ -239,6 +239,17 @@ handling, sync-first scraping with the queued fallback and polling, and the dedi
 parser selection. CI runs the same on 3.10,
 3.12 and 3.13.
 
+## Learn More
+
+For detailed configuration, advanced usage, and code examples in multiple languages, check the official documentation:
+
+- [Get started with Web API](https://oxylabs.io/products/web-api)
+- [Web API documentation](https://developers.oxylabs.io/products/web-api)
+
 ## License
 
 MIT
+
+## Contact Us
+
+If you have questions or need support, reach out to us at [support@oxylabs.io](mailto:support@oxylabs.io), or through live chat in the [Oxylabs Dashboard](https://dashboard.oxylabs.io/). For enterprise inquiries, contact your dedicated account manager.
