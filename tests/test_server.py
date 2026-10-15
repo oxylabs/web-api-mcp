@@ -8,6 +8,7 @@ import os
 import sys
 
 import httpx
+from mcp.types import InitializeRequestParams
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 os.environ["OXYLABS_WEB_API_KEY"] = "test-key"
@@ -677,21 +678,33 @@ def test_offloaded_pages_are_never_called_thin():
 
 
 def test_client_name_cannot_inject_a_header():
-    assert srv._sanitize_client_field("evil\r\nX-Injected: 1") == "evil  X-Injected: 1"
-    assert len(srv._sanitize_client_field("x" * 5000)) == 64
-    assert srv._sanitize_client_field("  \t  ") is None
-    assert srv._sanitize_client_field(None) is None
+    assert srv._normalize_client_name("evil\r\nX-Injected: 1") == "evil-x-injected:-1"
+    assert srv._normalize_client_name(" Claude \t Code ") == "claude-code"
+    assert srv._normalize_client_name("x" * 63 + " y") == "x" * 63
+    assert len(srv._normalize_client_name("x" * 5000)) == 64
+    assert srv._normalize_client_name("  \t  ") is None
+    assert srv._normalize_client_name(None) is None
+    assert srv._normalize_client_name("Cursor™") == "cursor"
+    assert srv._normalize_client_name("クライ") is None
 
-    # And the header it builds is single-line whatever the client called itself.
-    class _Bad:
+    params = InitializeRequestParams.model_validate(
+        {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "Claude\r\nCode", "version": "1"},
+        }
+    )
+
+    class _Ctx:
         class request_context:
             class session:
-                class client_params:
-                    class clientInfo:
-                        name = "a\r\nb"
+                client_params = params
 
-    header = srv._sdk_header(_Bad())
-    assert "\r" not in header and "\n" not in header, header
+    python = srv.python_version()
+    assert srv._sdk_header(_Ctx()) == (
+        f"oxylabs-web-api-mcp/{srv.VERSION} claude-code (python {python})"
+    )
+    assert srv._sdk_header(None) == f"oxylabs-web-api-mcp/{srv.VERSION} (python {python})"
 
 
 def test_token_estimate_is_script_aware():

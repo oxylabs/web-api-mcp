@@ -235,32 +235,33 @@ def _api_key() -> str:
     return key
 
 
-def _sanitize_client_field(value: object, max_length: int = 64) -> str | None:
-    """Make a client-supplied string safe to put in an outbound header.
+def _normalize_client_name(value: object, max_length: int = 64) -> str | None:
+    """Turn the client's self-reported name into one token for the `x-oxylabs-sdk` header.
 
     The client names itself during `initialize` and we forward that for attribution, so it
     is untrusted input on its way into a header value: control characters (CR and LF above
-    all) would let a malformed name split or inject headers, and an unbounded name would
-    push the request past an upstream header limit.
+    all) would let a malformed name split or inject headers, non-ASCII would make httpx
+    refuse to encode the header, and an unbounded name would push the request past an
+    upstream header limit.
     """
     if not isinstance(value, str):
         return None
-    cleaned = "".join(char if char.isprintable() else " " for char in value).strip()
-    return cleaned[:max_length] or None
+    cleaned = "".join(char if char.isascii() and char.isprintable() else " " for char in value)
+    return "-".join(cleaned.lower().split())[:max_length].rstrip("-") or None
 
 
 def _sdk_header(ctx: Context | None) -> str:
-    """Identify this server, and the client driving it, to the API."""
-    client = "oxylabs-web-api-mcp"
+    """Identify this server, and the MCP client driving it, to the API."""
     try:
-        name = _sanitize_client_field(
-            ctx.request_context.session.client_params.clientInfo.name  # type: ignore[union-attr]
-        )
-        if name:
-            client = f"{client}-{name}"
+        params = ctx.request_context.session.client_params  # type: ignore[union-attr]
+        # mcp 2 renamed the field to snake_case; mcp 1 only has the camelCase one.
+        info = getattr(params, "client_info", None) or getattr(params, "clientInfo", None)
+        client = _normalize_client_name(info.name)  # type: ignore[union-attr]
     except Exception:  # noqa: BLE001 — telemetry must never be the reason a call fails
-        pass
-    return f"{client}/{VERSION} (python {python_version()})"
+        client = None
+    name = os.environ.get("OXYLABS_SDK_NAME", "oxylabs-web-api-mcp")
+    product = f"{name}/{VERSION} {client}" if client else f"{name}/{VERSION}"
+    return f"{product} (python {python_version()})"
 
 
 # ------------------------------------------------------------------------- token budget
