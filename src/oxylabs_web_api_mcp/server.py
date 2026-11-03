@@ -998,7 +998,12 @@ async def search(
         ),
     ],
     max_results: Annotated[
-        int, Field(description="Number of results to return.", ge=1, le=20)
+        int,
+        Field(
+            description="Maximum number of results to return. The response may contain fewer.",
+            ge=1,
+            le=20,
+        ),
     ] = 10,
     location: Annotated[
         str | None,
