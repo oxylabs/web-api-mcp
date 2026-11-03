@@ -4,6 +4,7 @@ Run: python tests/test_server.py   (or: pytest)
 """
 
 import asyncio
+import base64
 import os
 import sys
 
@@ -119,6 +120,29 @@ def test_small_content_is_left_alone():
     out = srv._process_content(_big_payload(100), "markdown", srv.MAX_INLINE_TOKENS)["results"][0]
     assert out["markdown"] == "x" * 100
     assert "content_offloaded" not in out and "content_truncated" not in out
+
+
+def test_a_pdf_is_flagged_instead_of_returned_as_text():
+    raw = "%PDF-1.5\n%\\x8f\n1 0 obj\n" + "stream\\x9c\\x03" * 50_000
+    b64 = base64.b64encode(b"%PDF-1.5\n%\x8f\n1 0 obj\n" * 20_000).decode()
+    for pdf in (raw, "\n" + raw, b64):
+        for budget in (srv.MAX_INLINE_TOKENS, None):
+            page = _page(pdf)
+            out = srv._flag_thin_content(srv._process_content(page, "markdown", budget))["results"][
+                0
+            ]
+            assert out["markdown"] == "", out
+            assert out["content_binary"]["total_chars"] == len(pdf)
+            assert "content_offloaded" not in out and "content_truncated" not in out
+            assert "content_thin" not in out
+
+
+def test_a_pdf_under_screenshot_is_not_sent_as_an_image():
+    pdf = b"%PDF-1.5\n%\x8f\n1 0 obj\n"
+    page = {"results": [{"screenshot": base64.b64encode(pdf).decode()}]}
+    out = srv._pop_screenshots(page)
+    assert out is page, out
+    assert page["results"][0]["screenshot"]["bytes"] == len(pdf)
 
 
 def test_read_scraped_refuses_paths_outside_the_spill_dir():
