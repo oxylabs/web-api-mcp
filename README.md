@@ -20,7 +20,7 @@ The tools and their behavior are the same on both options, and the sections on s
 | `check_scrape` | Collect the result of a scrape the API is running in the background |
 | `read_scraped` | Read a large page that was offloaded to disk, in chunks (local stdio only) |
 | `list_scrapers` | List the scrape endpoints the API implements, grouped by parser support, or describe one's parameters |
-| `scrape_target` | Call a target-specific scrape endpoint with its own parameters, as content or as structured JSON |
+| `run_scraper` | Run a dedicated scrape endpoint with its own parameters, as content or as structured JSON |
 
 All six are annotated `readOnlyHint` — nothing here writes anything, so clients can run
 them without prompting.
@@ -209,7 +209,7 @@ Oversized content is measured in **tokens, not characters**: 40 000 characters o
 
 ## Sync first, queued only on a timeout
 
-Every scrape goes to the synchronous endpoint first. If it times out, the same request is sent to the corresponding asynchronous endpoint (`/v1/async/...`) and the agent gets a request id to poll. `async/...` endpoints passed to `scrape_target` are always queued.
+Every scrape goes to the synchronous endpoint first. If it times out, the same request is sent to the corresponding asynchronous endpoint (`/v1/async/...`) and the agent gets a request id to poll. `async/...` endpoints passed to `run_scraper` are always queued.
 
 ```json
 { "state": "pending", "request_id": "7504857924934611969", "note": "The synchronous call timed out (…), so the same request was queued instead. … call check_scrape('7504857924934611969') …" }

@@ -19,8 +19,8 @@ from oxylabs_web_api_mcp.server import (  # noqa: E402
     _detail,
     check_scrape,
     read_scraped,
+    run_scraper,
     scrape,
-    scrape_target,
 )
 
 
@@ -319,13 +319,13 @@ def test_scrape_sends_the_location_in_uppercase():
     assert api.posts[0][1]["location"] == "DE", api.posts
 
 
-def test_scrape_target_runs_sync_even_with_run_js_and_queues_async_endpoints():
+def test_run_scraper_runs_sync_even_with_run_js_and_queues_async_endpoints():
     with _api(lambda p: _done(p, html="<p>x</p>")) as api:
-        asyncio.run(scrape_target("scrape/amazon/search", {"query": "x", "run_js": True}))
+        asyncio.run(run_scraper("scrape/amazon/search", {"query": "x", "run_js": True}))
     assert api.posts[0][0] == "/v1/scrape/amazon/search", api.posts
 
     with _api(_pending) as api:
-        out = asyncio.run(scrape_target("async/scrape/chatgpt", {"prompt": "hi"}))
+        out = asyncio.run(run_scraper("async/scrape/chatgpt", {"prompt": "hi"}))
     assert api.posts[0][0] == "/v1/async/scrape/chatgpt"
     assert "check_scrape('7500000000000000001')" in out["note"]
 
@@ -393,7 +393,7 @@ def test_extract_passes_a_schema_to_the_ai_parser():
 def test_the_dedicated_parser_runs_first_where_there_is_one():
     with _api(lambda p: _done(p, json={"title": "t", "price": 9})) as api:
         out = asyncio.run(
-            scrape_target("scrape/amazon/product", {"query": "B0"}, json_prompt="title and price")
+            run_scraper("scrape/amazon/product", {"query": "B0"}, json_prompt="title and price")
         )
     ((path, payload),) = api.posts
     assert path == "/v1/scrape/amazon/product"
@@ -404,7 +404,7 @@ def test_the_dedicated_parser_runs_first_where_there_is_one():
 def test_an_empty_dedicated_result_falls_back_to_the_ai_parser():
     with _api(lambda p: _done(p, json=None), lambda p: _done(p, json={"title": "t"})) as api:
         out = asyncio.run(
-            scrape_target("scrape/amazon/product", {"query": "B0"}, json_prompt="the title")
+            run_scraper("scrape/amazon/product", {"query": "B0"}, json_prompt="the title")
         )
     assert [payload.get("json") for _, payload in api.posts] == [None, {"prompt": "the title"}]
     assert out["parser"] == "ai"
@@ -413,7 +413,7 @@ def test_an_empty_dedicated_result_falls_back_to_the_ai_parser():
 def test_parser_ai_skips_the_dedicated_parser():
     with _api(lambda p: _done(p, json={"seller": "s"})) as api:
         asyncio.run(
-            scrape_target(
+            run_scraper(
                 "scrape/amazon/product", {"query": "B0"}, json_prompt="the seller", parser="ai"
             )
         )
@@ -422,14 +422,14 @@ def test_parser_ai_skips_the_dedicated_parser():
 
 def test_structured_without_a_prompt_uses_the_dedicated_parser_only():
     with _api(lambda p: _done(p, json=None)) as api:
-        out = asyncio.run(scrape_target("scrape/amazon/product", {"query": "B0"}, structured=True))
+        out = asyncio.run(run_scraper("scrape/amazon/product", {"query": "B0"}, structured=True))
     assert len(api.posts) == 1 and out["parser"] == "dedicated"
 
 
 def test_structured_needs_a_prompt_where_there_is_no_dedicated_parser():
     with _api() as api:
         try:
-            asyncio.run(scrape_target("scrape", {"url": "https://ex.com"}, structured=True))
+            asyncio.run(run_scraper("scrape", {"url": "https://ex.com"}, structured=True))
         except ApiError as exc:
             assert "no dedicated parser" in str(exc), exc
         else:
@@ -440,7 +440,7 @@ def test_structured_needs_a_prompt_where_there_is_no_dedicated_parser():
 def test_endpoints_without_json_refuse_structured_output():
     with _api() as api:
         try:
-            asyncio.run(scrape_target("async/scrape/media", {"url": "x"}, json_prompt="anything"))
+            asyncio.run(run_scraper("async/scrape/media", {"url": "x"}, json_prompt="anything"))
         except ApiError as exc:
             assert "cannot return structured JSON" in str(exc), exc
         else:
@@ -451,7 +451,7 @@ def test_endpoints_without_json_refuse_structured_output():
 def test_a_queued_dedicated_parse_says_how_to_fall_back():
     with _api(_pending) as api:
         out = asyncio.run(
-            scrape_target("async/scrape/chatgpt", {"prompt": "hi"}, json_prompt="the citations")
+            run_scraper("async/scrape/chatgpt", {"prompt": "hi"}, json_prompt="the citations")
         )
     assert api.posts[0][0] == "/v1/async/scrape/chatgpt" and "json" not in api.posts[0][1]
     assert out["parser"] == "dedicated" and "request_id" in out
@@ -470,9 +470,7 @@ def test_parser_ai_without_a_prompt_says_what_it_needs():
     with _api() as api:
         try:
             asyncio.run(
-                scrape_target(
-                    "scrape/amazon/product", {"query": "B0"}, structured=True, parser="ai"
-                )
+                run_scraper("scrape/amazon/product", {"query": "B0"}, structured=True, parser="ai")
             )
         except ApiError as exc:
             assert "parser='ai' needs" in str(exc) and "no dedicated" not in str(exc), exc
@@ -493,7 +491,7 @@ def test_an_unknown_group_still_tries_the_dedicated_parser_without_a_prompt():
     srv._request = broken
     srv._JSON_GROUPS.clear()
     try:
-        out = asyncio.run(scrape_target("scrape/amazon/product", {"query": "B0"}, structured=True))
+        out = asyncio.run(run_scraper("scrape/amazon/product", {"query": "B0"}, structured=True))
     finally:
         srv._request = real
     assert posts == [{"query": "B0", "output": ["json"]}], posts
@@ -530,8 +528,8 @@ def test_scrape_rejects_a_place_name_as_location():
 
 def test_an_endpoint_without_a_sync_form_is_queued():
     with _api(_pending, _pending) as api:
-        asyncio.run(scrape_target("scrape/chatgpt", {"prompt": "hi"}))
-        asyncio.run(scrape_target("scrape/media", {"url": "https://ex.com/a.mp4"}))
+        asyncio.run(run_scraper("scrape/chatgpt", {"prompt": "hi"}))
+        asyncio.run(run_scraper("scrape/media", {"url": "https://ex.com/a.mp4"}))
     assert [path for path, _ in api.posts] == [
         "/v1/async/scrape/chatgpt",
         "/v1/async/scrape/media",
@@ -1165,7 +1163,7 @@ def _parsed(tag, json_body):
 def test_a_failed_dedicated_parse_falls_back_to_the_ai_parser():
     with _api(_parsed("PARSE_FAILED", {"x": None}), lambda p: _done(p, json={"t": 1})) as api:
         out = asyncio.run(
-            scrape_target("scrape/amazon/product", {"query": "B0"}, json_prompt="the title")
+            run_scraper("scrape/amazon/product", {"query": "B0"}, json_prompt="the title")
         )
     assert len(api.posts) == 2 and api.posts[1][1]["json"] == {"prompt": "the title"}
     assert out["parser"] == "ai"
@@ -1175,7 +1173,7 @@ def test_a_faulted_dedicated_parse_falls_back_but_a_failed_scrape_does_not():
     parse_fault = srv.ApiFaulted("faulted (PARSE_FAILED)", tag="PARSE_FAILED")
     with _api(parse_fault, lambda p: _done(p, json={"t": 1})) as api:
         out = asyncio.run(
-            scrape_target("scrape/amazon/product", {"query": "B0"}, json_prompt="the title")
+            run_scraper("scrape/amazon/product", {"query": "B0"}, json_prompt="the title")
         )
     assert out["parser"] == "ai" and len(api.posts) == 2
 
@@ -1183,7 +1181,7 @@ def test_a_faulted_dedicated_parse_falls_back_but_a_failed_scrape_does_not():
     with _api(scrape_fault) as api:
         try:
             asyncio.run(
-                scrape_target("scrape/amazon/product", {"query": "B0"}, json_prompt="the title")
+                run_scraper("scrape/amazon/product", {"query": "B0"}, json_prompt="the title")
             )
         except srv.ApiFaulted:
             pass
@@ -1196,7 +1194,7 @@ def test_a_partial_dedicated_parse_is_returned_with_its_verdict():
     tag = "PARSE_PARTIAL_SUCCESS_SOME_FIELDS_DEFAULT"
     with _api(_parsed(tag, {"title": "t"})) as api:
         out = asyncio.run(
-            scrape_target("scrape/amazon/product", {"query": "B0"}, json_prompt="the title")
+            run_scraper("scrape/amazon/product", {"query": "B0"}, json_prompt="the title")
         )
     assert len(api.posts) == 1 and out["parser"] == "dedicated"
     assert tag in out["parser_note"], out["parser_note"]
@@ -1256,7 +1254,7 @@ def test_a_target_scrape_without_output_budgets_the_format_the_api_picked():
         return _done({**payload, "output": ["html"]}, html="<p>" + "x" * size + "</p>")
 
     with _api(html_default):
-        out = asyncio.run(scrape_target("scrape/amazon/product", {"query": "B0"}))
+        out = asyncio.run(run_scraper("scrape/amazon/product", {"query": "B0"}))
     result = out["results"][0]
     assert "content_truncated" in result, result.keys()
     assert len(result["html"]) < size

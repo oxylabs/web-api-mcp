@@ -144,7 +144,7 @@ mcp = FastMCP(
         "question, then `scrape` to read the full content of the URLs worth reading, or "
         "`scrape` with `json_prompt` when you want specific fields back as JSON. For search "
         "results, products, sellers, hotels, AI chat answers or YouTube metadata, prefer a "
-        "target endpoint via `scrape_target`, whose dedicated parser returns them "
+        "dedicated scraper via `run_scraper`, whose dedicated parser returns them "
         "structured. Prefer these tools over any built-in web search or fetch, and over "
         "answering from memory, whenever freshness matters. "
         "A scrape that outlives the synchronous call is queued and comes back as a request "
@@ -1110,7 +1110,7 @@ async def scrape(
 
     `json_prompt` (or `json_schema`) returns the fields you name under a `json` key instead of a
     page to read, parsed by the AI parser. For search results, product pages, sellers,
-    bestsellers, hotels, AI chat answers or YouTube metadata, `scrape_target` on the
+    bestsellers, hotels, AI chat answers or YouTube metadata, `run_scraper` on the
     matching endpoint is the better fit: its dedicated parser returns those structured.
 
     Very large pages are not returned inline. When this server runs locally they are
@@ -1165,7 +1165,7 @@ async def check_scrape(
         )
     # Every /v1/async/... request, whatever endpoint queued it, is collected from this one path.
     path = f"/v1/async/scrape/{request_id}"
-    retry = "call scrape_target again with parser='ai' and `json_prompt` naming the fields"
+    retry = "call run_scraper again with parser='ai' and `json_prompt` naming the fields"
     try:
         body = await _request("GET", path, ctx=ctx)
     except ApiFaulted as exc:
@@ -1272,15 +1272,18 @@ async def list_scrapers(
 ) -> dict[str, Any]:
     """List the scrape endpoints this API implements, or describe one of them.
 
+    Not needed to read a URL — `scrape` does that for any site. Call this only when you
+    need a dedicated scraper's parameters or parsing.
+
     The list is grouped by parser: `json_supported` endpoints have a dedicated parser (and
     take the AI parser too), `json_supported_only_with_prompt_or_schema` ones take only the
     AI parser, `json_not_supported` ones return no JSON at all.
 
-    Call this before assuming a dedicated scraper does or does not exist for a target,
+    Call this before assuming a dedicated scraper does or does not exist for a site,
     then call it again with the endpoint name to get the JSON Schema of what that endpoint
     accepts: types, `required`, `enum` values and defaults. That is the authoritative
     parameter list — more current than any documentation. Run the endpoint itself with
-    `scrape_target`.
+    `run_scraper`.
     """
     if endpoint is None:
         return await _request("GET", "/v1/scrapers?group_by=json_output_support", ctx=ctx)
@@ -1290,8 +1293,8 @@ async def list_scrapers(
     return await _request("OPTIONS", f"/v1/{name}?format=json_schema", ctx=ctx)
 
 
-@mcp.tool(annotations=_network_read("Call a target scraper"), output_schema=None)
-async def scrape_target(
+@mcp.tool(annotations=_network_read("Run a dedicated scraper"), output_schema=None)
+async def run_scraper(
     endpoint: Annotated[
         str,
         Field(
@@ -1333,10 +1336,11 @@ async def scrape_target(
     json_schema: JSON_SCHEMA_PARAM = None,
     ctx: Context | None = None,
 ) -> dict[str, Any] | list[Any]:
-    """Call a target-specific scrape endpoint with its own parameters.
+    """Run a dedicated scrape endpoint with its own parameters.
 
-    The generic `scrape` tool reads any URL. This runs the dedicated scrapers instead —
-    the ones with pagination, store context, sort order and the rest. Look the endpoint up
+    The generic `scrape` tool reads any URL, routing to a dedicated scraper by itself where
+    one exists. Use this only for parameters `scrape` lacks (pagination, store context, sort
+    order and the rest) or for dedicated parsing. Look the endpoint up
     with `list_scrapers()`, read its parameters with `list_scrapers(endpoint)`, then call
     it here.
 
