@@ -35,13 +35,13 @@ more, or both:
 | Need | Call | When |
 |---|---|---|
 | Find pages on a topic | `search` | No URL yet. One question per search |
-| Read a page you have a URL for | `scrape` | The default. Markdown, one fetch |
+| Read a page you have a URL for | `scrape` | The default, for any site. Markdown, one fetch |
 | Read a page that came back empty or with indication that it requires javascript rendering | `scrape` + `run_js=True` | Only after a plain scrape returned `content_thin` |
 | Collect a queued request | `check_scrape` | A call returned a `request_id`: every 5s while it is pending |
 | Walk a page too big to return | `read_scraped` | The result carried `content_offloaded` |
-| Typical structured content: search results, products, sellers, bestsellers, hotels, AI chat answers, YouTube metadata | `scrape_target(endpoint, params, structured=True, json_prompt=…)` | A target endpoint exists for it — its dedicated parser returns the content in a predefined shape |
+| Typical structured content: search results, products, sellers, bestsellers, hotels, AI chat answers, YouTube metadata | `run_scraper(endpoint, params, structured=True, json_prompt=…)` | A dedicated endpoint exists for it — its dedicated parser returns the content in a predefined shape |
 | Named fields off any page | `scrape(url, json_prompt=…)` | No dedicated endpoint fits, or its parser lacked the fields. The AI parser extracts what you describe |
-| A target-specific scraper | `list_scrapers` then `scrape_target` | The generic scraper does not carry the parameter you need |
+| A site-specific scraper | `list_scrapers` then `run_scraper` | The generic scraper does not carry the parameter you need |
 
 **Done when:** the narrowest call that could answer the question has run, you have read its
 output rather than assumed it, and every claim you are about to make carries the URL it came
@@ -116,7 +116,7 @@ The signatures — *which* tool to reach for is the decision table above:
 `scrape(url, format, location, device, run_js, json_prompt, json_schema)` ·
 `check_scrape(request_id)` · `read_scraped(path, offset, length)` ·
 `list_scrapers(endpoint)` ·
-`scrape_target(endpoint, params, structured, parser, json_prompt, json_schema)`
+`run_scraper(endpoint, params, structured, parser, json_prompt, json_schema)`
 
 `scrape`'s `format` is `"markdown"` (default), `"html"` or `"screenshot"`. Every other
 parameter carries the meaning it has in the field tables below — `location` is a two-letter
@@ -184,7 +184,7 @@ list. The flow:
 1. Find the endpoint: `list_scrapers()` shows which ones have
    a dedicated parser (`json_supported`), only the AI parser
    (`json_supported_only_with_prompt_or_schema`), or no JSON at all (`json_not_supported`).
-2. Call `scrape_target(endpoint, params, structured=True, json_prompt="<the fields you need>")`.
+2. Call `run_scraper(endpoint, params, structured=True, json_prompt="<the fields you need>")`.
    The server runs the dedicated parser where there is one, and falls back to the AI parser
    by itself when there is none, or when it failed or returned nothing. The result's
    `parser` says which one answered, and `parser_note` quotes the dedicated parser's
@@ -208,7 +208,7 @@ page in because it was offered is the mistake this is designed to prevent.
 ### Target-specific endpoints
 
 `list_scrapers()` for what exists, `list_scrapers("<endpoint>")` for its parameters and
-types, then `scrape_target(endpoint, params)` to call it. Read the parameters rather than
+types, then `run_scraper(endpoint, params)` to call it. Read the parameters rather than
 guessing them — that response is more current than any documentation, including this file.
 
 ## The endpoints
