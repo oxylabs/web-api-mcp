@@ -42,11 +42,7 @@ def _api_key() -> str:
 
     key = os.environ.get("OXYLABS_WEB_API_KEY", "").strip()
     if not key:
-        raise ApiError(
-            "No Oxylabs Web API key. Send it as an 'Authorization: Bearer <key>' header, "
-            "or set OXYLABS_WEB_API_KEY in the server environment (see .env.example) and "
-            "restart the MCP server."
-        )
+        raise ApiError("Oxylabs Web API key is missing.")
     return key
 
 
