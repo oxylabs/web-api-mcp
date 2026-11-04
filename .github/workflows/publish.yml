@@ -30,10 +30,20 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v4
-      - name: Check the tag matches the project version
+      - name: Check the tag and server.json match the project version
         run: |
           version=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
           [ "v$version" = "${GITHUB_REF_NAME}" ] || { echo "tag ${GITHUB_REF_NAME} != pyproject version $version"; exit 1; }
+          python - "$version" <<'EOF'
+          import json, sys
+          version = sys.argv[1]
+          manifest = json.load(open("server.json"))
+          found = {"version": manifest["version"]}
+          found.update({f"packages[{i}].version": p["version"] for i, p in enumerate(manifest["packages"])})
+          wrong = {k: v for k, v in found.items() if v != version}
+          if wrong:
+              sys.exit(f"server.json does not match pyproject version {version}: {wrong}")
+          EOF
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

@@ -268,7 +268,7 @@ Full API documentation: **[Oxylabs Web API docs](https://developers.oxylabs.io/p
 ```bash
 pip install -e '.[dev]'
 ruff check . && ruff format --check .
-pytest                         # or: python tests/test_server.py
+pytest
 ./scripts/sync-skill.sh        # refresh the bundled skill from web-api-skills
 ```
 
