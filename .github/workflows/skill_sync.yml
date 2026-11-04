@@ -1,0 +1,21 @@
+name: Skill in sync
+
+# The bundled skill is a copy of web-api-skills' SKILL.md. Fail when the two differ, on
+# every PR and daily (a change in web-api-skills doesn't trigger this repo's CI).
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare with web-api-skills main
+        run: ./scripts/sync-skill.sh --check https://raw.githubusercontent.com/oxylabs/web-api-skills/main/skills/oxylabs-web-api/SKILL.md

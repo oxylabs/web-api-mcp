@@ -201,7 +201,7 @@ Connecting the server is the whole install. The agent skill is bundled in the pa
 | `oxylabs://skill/web-api` | The skill itself, as Markdown |
 | prompt `web_research` | Takes a `question`, hands the agent the task plus the skill |
 
-`scripts/sync-skill.sh` refreshes the bundled copy from the skills repo — the canonical copy lives there, and the two must not drift.
+`scripts/sync-skill.sh` refreshes the bundled copy from the skills repo — the canonical copy lives there, and the two must not drift. Edit the skill in web-api-skills, never here: CI fails when the bundled copy differs from web-api-skills `main`.
 
 ## Fitting the client's context
 
@@ -270,6 +270,7 @@ pip install -e '.[dev]'
 ruff check . && ruff format --check .
 pytest
 ./scripts/sync-skill.sh        # refresh the bundled skill from web-api-skills
+./scripts/sync-skill.sh --check # what CI runs: fail if it has drifted
 ```
 
 The tests are offline: error parsing, input validation, envelope trimming, endpoint-name handling, sync-first scraping with the queued fallback and polling, and the dedicated/AI parser selection. CI runs the same on 3.10, 3.12 and 3.13.
