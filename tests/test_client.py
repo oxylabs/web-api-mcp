@@ -349,7 +349,7 @@ def test_missing_key_everywhere_is_an_actionable_error():
     try:
         client._api_key()
     except ApiError as exc:
-        assert "Authorization: Bearer" in str(exc), exc
+        assert str(exc) == "Oxylabs Web API key is missing.", exc
     else:
         raise AssertionError("expected ApiError when no key is available")
     finally:
