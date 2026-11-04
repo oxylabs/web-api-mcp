@@ -61,9 +61,15 @@ codex mcp add oxylabs-web-api \
   --bearer-token-env-var OXYLABS_WEB_API_KEY
 ```
 
-Cursor and other clients supporting custom headers:
+Cursor — one click, then make the key visible to Cursor (below):
 
-```bash
+[![Add to Cursor](https://cursor.com/deeplink/mcp-install-dark.svg)](https://cursor.com/en/install-mcp?name=oxylabs-web-api&config=eyJ1cmwiOiJodHRwczovL21jcC5veHlsYWJzLmlvL3dlYi1hcGktbWNwIiwiaGVhZGVycyI6eyJBdXRob3JpemF0aW9uIjoiQmVhcmVyICR7ZW52Ok9YWUxBQlNfV0VCX0FQSV9LRVl9In19)
+
+Cursor reads `${env:OXYLABS_WEB_API_KEY}` from its own environment. On macOS, Cursor opened from the Dock or Spotlight does not see variables exported in your shell profile, so either start it from a terminal where the key is exported, or replace `${env:OXYLABS_WEB_API_KEY}` with the key itself in **Cursor Settings → MCP**. Until Cursor can see the key, the server connects and lists its tools, but every call answers `Authentication failed (401)`.
+
+Cursor (manual, `~/.cursor/mcp.json`) and other clients supporting custom headers:
+
+```json
 {
   "mcpServers": {
     "oxylabs-web-api": {
