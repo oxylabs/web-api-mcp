@@ -1,0 +1,342 @@
+"""Sync-then-queue scraping and the dedicated-then-AI parser choice."""
+
+from __future__ import annotations
+
+import asyncio
+
+import httpx
+from helpers import _api, _done, _FakeCtx, _pending, _stub_client
+
+from oxylabs_web_api_mcp import client, config, scraping
+from oxylabs_web_api_mcp.errors import ApiError, ApiFaulted, ApiTimeout
+from oxylabs_web_api_mcp.tools import run_scraper, scrape
+
+
+def test_run_js_goes_sync_first_and_returns_the_content():
+    with _api(lambda p: _done(p, markdown="word " * 400)) as api:
+        out = asyncio.run(scrape("https://ex.com", run_js=True))
+    assert api.posts == [("/v1/scrape", api.posts[0][1])], api.posts
+    assert api.posts[0][1]["run_js"] is True
+    assert out["results"][0]["markdown"].startswith("word"), out
+
+
+def test_a_sync_timeout_is_sent_to_the_async_endpoint():
+    timeout = ApiTimeout("/v1/scrape returned 500: Scraping took too long, try again.")
+    with _api(timeout, _pending) as api:
+        out = asyncio.run(scrape("https://ex.com", run_js=True))
+    assert [path for path, _ in api.posts] == ["/v1/scrape", "/v1/async/scrape"], api.posts
+    assert api.posts[0][1] == api.posts[1][1], "the queued request must be the same payload"
+    assert out["state"] == "pending" and out["request_id"] == "7500000000000000001"
+    assert "check_scrape('7500000000000000001')" in out["note"]
+    assert "timed out" in out["note"], out["note"]
+    assert "params" not in out and "metadata" not in out
+
+
+def test_a_gateway_timeout_on_sync_is_retried_not_queued():
+    calls = []
+
+    def gateway_timeout(method, url):
+        calls.append(url)
+        if len(calls) == 1:
+            return httpx.Response(504, text="Gateway Timeout", request=httpx.Request(method, url))
+        done = {"state": "done", "results": [{"markdown": "x" * 600}], "params": {}}
+        return httpx.Response(200, json=done, request=httpx.Request(method, url))
+
+    real_client, real_delay = httpx.AsyncClient, config.RETRY_BASE_DELAY
+    httpx.AsyncClient, config.RETRY_BASE_DELAY = _stub_client(gateway_timeout), 0
+    try:
+        asyncio.run(scrape("https://ex.com"))
+    finally:
+        httpx.AsyncClient, config.RETRY_BASE_DELAY = real_client, real_delay
+    assert [u.rsplit("/v1/", 1)[1] for u in calls] == ["scrape", "scrape"], calls
+
+
+def test_run_scraper_runs_sync_even_with_run_js_and_queues_async_endpoints():
+    with _api(lambda p: _done(p, html="<p>x</p>")) as api:
+        asyncio.run(run_scraper("scrape/amazon/search", {"query": "x", "run_js": True}))
+    assert api.posts[0][0] == "/v1/scrape/amazon/search", api.posts
+
+    with _api(_pending) as api:
+        out = asyncio.run(run_scraper("async/scrape/chatgpt", {"prompt": "hi"}))
+    assert api.posts[0][0] == "/v1/async/scrape/chatgpt"
+    assert "check_scrape('7500000000000000001')" in out["note"]
+
+
+def test_extract_on_a_url_uses_the_ai_parser_without_asking():
+    with _api(lambda p: _done(p, json={"title": "t"})) as api:
+        out = asyncio.run(scrape("https://ex.com", json_prompt="the title", ctx=_FakeCtx()))
+    assert api.calls[0][1] == "/v1/scrapers?group_by=json_output_support", api.calls
+    ((path, payload),) = api.posts
+    assert path == "/v1/scrape"
+    assert payload[config.OUTPUT_PARAM] == ["json"]
+    assert payload["json"] == {"prompt": "the title"}
+    assert out["parser"] == "ai" and out["results"][0]["json"] == {"title": "t"}
+
+
+def test_extract_passes_a_schema_to_the_ai_parser():
+    schema = {"type": "object", "properties": {"title": {"type": "string"}}}
+    with _api(lambda p: _done(p, json={"title": "t"})) as api:
+        asyncio.run(scrape("https://ex.com", json_schema=schema))
+    assert api.posts[0][1]["json"] == {"schema": schema}
+
+
+def test_the_dedicated_parser_runs_first_where_there_is_one():
+    with _api(lambda p: _done(p, json={"title": "t", "price": 9})) as api:
+        out = asyncio.run(
+            run_scraper("scrape/amazon/product", {"query": "B0"}, json_prompt="title and price")
+        )
+    ((path, payload),) = api.posts
+    assert path == "/v1/scrape/amazon/product"
+    assert payload[config.OUTPUT_PARAM] == ["json"] and "json" not in payload, payload
+    assert out["parser"] == "dedicated" and "parser='ai'" in out["parser_note"]
+
+
+def test_an_empty_dedicated_result_falls_back_to_the_ai_parser():
+    with _api(lambda p: _done(p, json=None), lambda p: _done(p, json={"title": "t"})) as api:
+        out = asyncio.run(
+            run_scraper("scrape/amazon/product", {"query": "B0"}, json_prompt="the title")
+        )
+    assert [payload.get("json") for _, payload in api.posts] == [None, {"prompt": "the title"}]
+    assert out["parser"] == "ai"
+
+
+def test_parser_ai_skips_the_dedicated_parser():
+    with _api(lambda p: _done(p, json={"seller": "s"})) as api:
+        asyncio.run(
+            run_scraper(
+                "scrape/amazon/product", {"query": "B0"}, json_prompt="the seller", parser="ai"
+            )
+        )
+    assert len(api.posts) == 1 and api.posts[0][1]["json"] == {"prompt": "the seller"}
+
+
+def test_structured_without_a_prompt_uses_the_dedicated_parser_only():
+    with _api(lambda p: _done(p, json=None)) as api:
+        out = asyncio.run(run_scraper("scrape/amazon/product", {"query": "B0"}, structured=True))
+    assert len(api.posts) == 1 and out["parser"] == "dedicated"
+
+
+def test_structured_needs_a_prompt_where_there_is_no_dedicated_parser():
+    with _api() as api:
+        try:
+            asyncio.run(run_scraper("scrape", {"url": "https://ex.com"}, structured=True))
+        except ApiError as exc:
+            assert "no dedicated parser" in str(exc), exc
+        else:
+            raise AssertionError("expected ApiError without json_prompt on a prompt-only endpoint")
+    assert not api.posts
+
+
+def test_endpoints_without_json_refuse_structured_output():
+    with _api() as api:
+        try:
+            asyncio.run(run_scraper("async/scrape/media", {"url": "x"}, json_prompt="anything"))
+        except ApiError as exc:
+            assert "cannot return structured JSON" in str(exc), exc
+        else:
+            raise AssertionError("json_not_supported must be refused")
+    assert not api.posts
+
+
+def test_a_queued_dedicated_parse_says_how_to_fall_back():
+    with _api(_pending) as api:
+        out = asyncio.run(
+            run_scraper("async/scrape/chatgpt", {"prompt": "hi"}, json_prompt="the citations")
+        )
+    assert api.posts[0][0] == "/v1/async/scrape/chatgpt" and "json" not in api.posts[0][1]
+    assert out["parser"] == "dedicated" and "request_id" in out
+    assert "check_scrape" in out["parser_note"], out["parser_note"]
+
+
+def test_a_queued_ai_parse_is_not_called_extracted():
+    timeout = ApiTimeout("/v1/scrape returned 500: REQUEST_FAILED_SCRAPE_TIMEOUT")
+    with _api(timeout, _pending):
+        out = asyncio.run(scrape("https://ex.com", json_prompt="the title"))
+    assert out["parser"] == "ai" and out["state"] == "pending", out
+    assert "Queued" in out["parser_note"] and "Extracted" not in out["parser_note"]
+
+
+def test_parser_ai_without_a_prompt_says_what_it_needs():
+    with _api() as api:
+        try:
+            asyncio.run(
+                run_scraper("scrape/amazon/product", {"query": "B0"}, structured=True, parser="ai")
+            )
+        except ApiError as exc:
+            assert "parser='ai' needs" in str(exc) and "no dedicated" not in str(exc), exc
+        else:
+            raise AssertionError("parser='ai' without a prompt must be refused")
+    assert not api.posts
+
+
+def test_an_unknown_group_still_tries_the_dedicated_parser_without_a_prompt():
+    async def broken(method, path, payload=None, **kwargs):
+        if path.startswith("/v1/scrapers"):
+            raise ApiError("/v1/scrapers returned 500: down")
+        posts.append(payload)
+        return _done(payload, json={"title": "t"})
+
+    posts = []
+    real = client._request
+    client._request = broken
+    scraping._JSON_GROUPS.clear()
+    try:
+        out = asyncio.run(run_scraper("scrape/amazon/product", {"query": "B0"}, structured=True))
+    finally:
+        client._request = real
+    assert posts == [{"query": "B0", "output": ["json"]}], posts
+    assert out["parser"] == "dedicated"
+
+
+def test_an_endpoint_without_a_sync_form_is_queued():
+    with _api(_pending, _pending) as api:
+        asyncio.run(run_scraper("scrape/chatgpt", {"prompt": "hi"}))
+        asyncio.run(run_scraper("scrape/media", {"url": "https://ex.com/a.mp4"}))
+    assert [path for path, _ in api.posts] == [
+        "/v1/async/scrape/chatgpt",
+        "/v1/async/scrape/media",
+    ], api.posts
+
+
+def test_parser_groups_are_cached_per_key():
+    with _api(lambda p: _done(p, json={"a": 1}), lambda p: _done(p, json={"a": 1})) as api:
+        asyncio.run(scrape("https://ex.com", json_prompt="a"))
+        asyncio.run(scrape("https://ex.com", json_prompt="a"))
+    lookups = [c for c in api.calls if c[1].startswith("/v1/scrapers")]
+    assert len(lookups) == 1, api.calls
+
+
+def test_a_failed_group_lookup_does_not_block_extraction():
+    async def broken(method, path, payload=None, **kwargs):
+        if path.startswith("/v1/scrapers"):
+            raise ApiError("/v1/scrapers returned 500: down")
+        return _done(payload, json={"a": 1})
+
+    real = client._request
+    client._request = broken
+    scraping._JSON_GROUPS.clear()
+    try:
+        out = asyncio.run(scrape("https://ex.com", json_prompt="a"))
+    finally:
+        client._request = real
+    assert out["parser"] == "ai"
+
+
+def test_the_sync_endpoints_timeout_problem_is_queued_without_a_resend():
+    calls = []
+    problem = {
+        "status": 500,
+        "title": "REQUEST_FAILED_SCRAPE_TIMEOUT",
+        "detail": "Scraping took too long, try again.",
+        "instance": "trace-1",
+    }
+
+    def answer(method, url):
+        calls.append(url)
+        if url.endswith("/v1/scrape"):
+            return httpx.Response(500, json=problem, request=httpx.Request(method, url))
+        queued = {"state": "pending", "metadata": {"request_id": "7500000000000000009"}}
+        return httpx.Response(200, json=queued, request=httpx.Request(method, url))
+
+    real_client, real_delay = httpx.AsyncClient, config.RETRY_BASE_DELAY
+    httpx.AsyncClient, config.RETRY_BASE_DELAY = _stub_client(answer), 0
+    try:
+        out = asyncio.run(scrape("https://ex.com", run_js=True))
+    finally:
+        httpx.AsyncClient, config.RETRY_BASE_DELAY = real_client, real_delay
+    assert [u.rsplit("/v1/", 1)[1] for u in calls] == ["scrape", "async/scrape"], calls
+    assert out["request_id"] == "7500000000000000009", out
+    assert "Scraping took too long" in out["note"], out["note"]
+
+
+def test_a_faulted_sync_scrape_is_reported_not_resent():
+    calls = []
+    problem = {
+        "status": 500,
+        "title": "REQUEST_FAILED_AFTER_TOO_MANY_RETRIES",
+        "detail": "The request failed after the maximum number of retries.",
+        "instance": "trace-2",
+        "state": "faulted",
+        "params": {"url": "https://ex.com"},
+        "metadata": {"timestamp": 1, "request_id": "r-1"},
+    }
+
+    def faulted(method, url):
+        calls.append(url)
+        return httpx.Response(500, json=problem, request=httpx.Request(method, url))
+
+    real_client, real_delay = httpx.AsyncClient, config.RETRY_BASE_DELAY
+    httpx.AsyncClient, config.RETRY_BASE_DELAY = _stub_client(faulted), 0
+    try:
+        asyncio.run(scrape("https://ex.com"))
+    except ApiFaulted as exc:
+        assert exc.tag == "REQUEST_FAILED_AFTER_TOO_MANY_RETRIES", exc.tag
+        assert "maximum number of retries" in str(exc) and "r-1" in str(exc), exc
+        assert len(calls) == 1, "a faulted scrape is the agent's retry to make, not a resend"
+    else:
+        raise AssertionError("a faulted sync request is a failure")
+    finally:
+        httpx.AsyncClient, config.RETRY_BASE_DELAY = real_client, real_delay
+
+
+def _parsed(tag, json_body):
+    def answer(payload):
+        out = _done(payload, json=json_body)
+        out["results"][0]["metadata"] = {"statuses": {"json_parse": {"code": 0, "tag": tag}}}
+        return out
+
+    return answer
+
+
+def test_a_failed_dedicated_parse_falls_back_to_the_ai_parser():
+    with _api(_parsed("PARSE_FAILED", {"x": None}), lambda p: _done(p, json={"t": 1})) as api:
+        out = asyncio.run(
+            run_scraper("scrape/amazon/product", {"query": "B0"}, json_prompt="the title")
+        )
+    assert len(api.posts) == 2 and api.posts[1][1]["json"] == {"prompt": "the title"}
+    assert out["parser"] == "ai"
+
+
+def test_a_faulted_dedicated_parse_falls_back_but_a_failed_scrape_does_not():
+    parse_fault = ApiFaulted("faulted (PARSE_FAILED)", tag="PARSE_FAILED")
+    with _api(parse_fault, lambda p: _done(p, json={"t": 1})) as api:
+        out = asyncio.run(
+            run_scraper("scrape/amazon/product", {"query": "B0"}, json_prompt="the title")
+        )
+    assert out["parser"] == "ai" and len(api.posts) == 2
+
+    scrape_fault = ApiFaulted("faulted", tag="REQUEST_FAILED_AFTER_TOO_MANY_RETRIES")
+    with _api(scrape_fault) as api:
+        try:
+            asyncio.run(
+                run_scraper("scrape/amazon/product", {"query": "B0"}, json_prompt="the title")
+            )
+        except ApiFaulted:
+            pass
+        else:
+            raise AssertionError("a failed scrape would fail the AI parser too")
+    assert len(api.posts) == 1
+
+
+def test_a_partial_dedicated_parse_is_returned_with_its_verdict():
+    tag = "PARSE_PARTIAL_SUCCESS_SOME_FIELDS_DEFAULT"
+    with _api(_parsed(tag, {"title": "t"})) as api:
+        out = asyncio.run(
+            run_scraper("scrape/amazon/product", {"query": "B0"}, json_prompt="the title")
+        )
+    assert len(api.posts) == 1 and out["parser"] == "dedicated"
+    assert tag in out["parser_note"], out["parser_note"]
+
+
+def test_a_target_scrape_without_output_budgets_the_format_the_api_picked():
+    config.SPILL_ENABLED = False
+    size = config.MAX_INLINE_TOKENS * 4 + 5000
+
+    def html_default(payload):
+        return _done({**payload, "output": ["html"]}, html="<p>" + "x" * size + "</p>")
+
+    with _api(html_default):
+        out = asyncio.run(run_scraper("scrape/amazon/product", {"query": "B0"}))
+    result = out["results"][0]
+    assert "content_truncated" in result, result.keys()
+    assert len(result["html"]) < size
