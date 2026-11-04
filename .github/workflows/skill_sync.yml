@@ -3,7 +3,7 @@ name: Sync skill
 # The bundled skill is a copy of web-api-skills' SKILL.md (the canonical one). Daily, copy
 # it over the bundled one and, if that changes anything, open or update a PR with the change.
 # Nothing blocks other PRs; the sync PR handles the drift on its own.
-# Needs Settings → Actions → "Allow GitHub Actions to create and approve pull requests".
+# Relies on the repo setting that lets GitHub Actions create pull requests (enabled).
 
 on:
   schedule:
