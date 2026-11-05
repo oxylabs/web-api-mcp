@@ -8,17 +8,20 @@ import os
 from helpers import _headers
 
 from oxylabs_web_api_mcp import config, content
-from oxylabs_web_api_mcp.tools import read_scraped
+from oxylabs_web_api_mcp.tools import read_result
 
 
-def _big_payload(chars: int) -> dict:
+def _big_payload(chars: int, request_id: str | None = "7504857924934611969") -> dict:
     # The live API's result shape: page text under the format's own key, the scraped
     # URL under the result's `metadata` — there is no fused `content` field.
-    return {
+    payload = {
         "state": "done",
         "results": [{"markdown": "x" * chars, "metadata": {"url": "https://ex.com/a"}}],
         "params": {"url": "https://ex.com/a"},
     }
+    if request_id:
+        payload["metadata"] = {"timestamp": 1, "request_id": request_id}
+    return payload
 
 
 def test_oversized_content_spills_to_disk_when_local(tmp_dir=None):
@@ -37,12 +40,19 @@ def test_oversized_content_spills_to_disk_when_local(tmp_dir=None):
         assert len(result["markdown"]) == config.PREVIEW_CHARS, len(result["markdown"])
         assert "content_truncated" not in result
         assert os.path.isfile(info["path"]), info
+        assert "read_result('7504857924934611969', page=0, offset=2000)" in info["note"]
 
-        # The agent walks the file in chunks and reaches the end.
-        first = asyncio.run(read_scraped(info["path"], offset=0, length=1000))
+        # The agent walks the page in chunks, by its request id, and reaches the end.
+        first = asyncio.run(read_result("7504857924934611969", offset=0, length=1000))
         assert first["returned_chars"] == 1000 and not first["eof"], first
-        last = asyncio.run(read_scraped(info["path"], offset=size - 10, length=1000))
+        last = asyncio.run(read_result("7504857924934611969", offset=size - 10, length=1000))
         assert last["eof"] and last["returned_chars"] == 10, last
+
+        # A page without a request id could not be found again, so it is cut short instead.
+        out = content._process_content(
+            _big_payload(size, request_id=None), "markdown", config.MAX_INLINE_TOKENS
+        )
+        assert "content_truncated" in out["results"][0] and "content_offloaded" not in out
     finally:
         config.SPILL_ENABLED = False
         del os.environ["OXYLABS_SPILL_DIR"]
@@ -180,3 +190,16 @@ def test_client_can_declare_its_own_token_budget():
         assert content._token_budget() is None
     with _headers({"x-mcp-max-tokens": "nonsense"}):
         assert content._token_budget() == config.MAX_INLINE_TOKENS
+
+
+def test_spill_files_are_named_by_request_id_and_page():
+    url = "https://ex.com/a"
+    # Each page of a request gets its own file, traceable to the request.
+    assert content._spill_stem(url, "7504857924934611969") == "7504857924934611969-0"
+    assert content._spill_stem(url, 7504857924934611969, 2) == "7504857924934611969-2"
+    # Without an id, or with one that is not all digits, the name is a hash of the URL:
+    # an id from the API never shapes a path.
+    hashed = content._spill_stem(url)
+    assert len(hashed) == 16 and int(hashed, 16) >= 0
+    for odd in ("", "../../etc/passwd", "12a", "١٢٣"):
+        assert content._spill_stem(url, odd) == hashed, odd

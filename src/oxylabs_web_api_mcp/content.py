@@ -76,12 +76,37 @@ def _prune_spills(directory: Path) -> None:
             pass  # Another process got there first, or the file is not ours to remove.
 
 
-def _spill(text: str, url: str, fmt: str) -> Path:
+def _request_id(value: Any) -> str | None:
+    """`value` as a request id, or None when it is not one. Ids come from the API and end up
+    in paths and URLs, so only all-digit ones are taken."""
+    if value is not None and re.fullmatch(r"[0-9]+", str(value)):
+        return str(value)
+    return None
+
+
+def _spill_stem(url: str, request_id: Any = None, index: int = 0) -> str:
+    """A spill file's name: the request id and the page's place in its results.
+
+    `7504857924934611969-0` names the first page of that request, so `read_result` finds it
+    by the id and page, and two requests for one URL — fetched from another `location`,
+    say — never write over each other. A request returns several pages at times (a search
+    over a few result pages), hence the index. Without an id the name is a hash of the URL.
+    """
+    if _request_id(request_id):
+        return f"{request_id}-{index}"
+    return hashlib.sha256(url.encode()).hexdigest()[:16]
+
+
+def _spill_path(url: str, fmt: str, request_id: Any = None, index: int = 0) -> Path:
+    """Where `_spill` writes a page: its `_spill_stem`, suffixed by its format."""
+    ext = {"markdown": "md", "json": "json"}.get(fmt, "html")
+    return _spill_dir() / f"{_spill_stem(url, request_id, index)}.{ext}.txt"
+
+
+def _spill(text: str, url: str, fmt: str, request_id: Any = None, index: int = 0) -> Path:
     """Write oversized content to the spill dir and return its path."""
-    directory = _spill_dir()
-    _prune_spills(directory)
-    stem = hashlib.sha256(url.encode()).hexdigest()[:16]
-    path = directory / f"{stem}.{'md' if fmt == 'markdown' else 'html'}.txt"
+    path = _spill_path(url, fmt, request_id, index)
+    _prune_spills(path.parent)
     path.write_text(text, encoding="utf-8")
     return path
 
@@ -92,27 +117,38 @@ def _result_url(result: dict[str, Any]) -> str:
     return str(metadata.get("url") or "") if isinstance(metadata, dict) else ""
 
 
-def _offload(result: dict[str, Any], text: str, url: str, fmt: str, budget: int) -> None:
+def _offload(
+    result: dict[str, Any],
+    text: str,
+    url: str,
+    fmt: str,
+    budget: int,
+    request_id: Any = None,
+    index: int = 0,
+) -> None:
     """Replace oversized page text under the format's key with a pointer or a notice.
 
     Each requested `output` value comes back under its own result key (`markdown`, `html`).
+    A page goes to disk only when it has a request id, which is what `read_result` finds
+    it by.
     """
     tokens = _estimate_tokens(text)
-    if config.SPILL_ENABLED:
-        path = _spill(text, url, fmt)
-        result[fmt] = text[: config.PREVIEW_CHARS]
+    request_id = _request_id(request_id)
+    if config.SPILL_ENABLED and request_id:
+        path = _spill(text, url, fmt, request_id, index)
+        shown = min(config.PREVIEW_CHARS, len(text))
+        result[fmt] = text[:shown]
         result["content_offloaded"] = {
             "path": str(path),
             "format": fmt,
             "total_chars": len(text),
             "estimated_tokens": tokens,
-            "preview_chars": min(config.PREVIEW_CHARS, len(text)),
+            "preview_chars": shown,
             "note": (
-                f"`{fmt}` above is only the first "
-                f"{min(config.PREVIEW_CHARS, len(text))} characters. The full page is on disk. "
-                "Read it with the `read_scraped` tool: read_scraped(path, offset=0), then "
-                "keep calling it with the `next_offset` it returns until `eof` is true. "
-                "Read only as far as you need — do not pull the whole file in by reflex."
+                f"`{fmt}` above is only the first {shown} characters. Read on with "
+                f"read_result('{request_id}', page={index}, offset={shown}), then keep "
+                "calling it with the `next_offset` it returns until `eof` is true. Read only "
+                "as far as you need — do not pull the whole page in by reflex."
             ),
         }
     else:
@@ -131,7 +167,7 @@ def _offload(result: dict[str, Any], text: str, url: str, fmt: str, budget: int)
                 "path to read in chunks. To see the rest: scrape a more specific URL, ask "
                 "for the section you need with `scrape(json_prompt=...)`, raise the budget with an "
                 "`X-MCP-Max-Tokens` header if your client can take more, or run the server "
-                "over stdio, where full pages go to disk and `read_scraped` walks them."
+                "over stdio, where full pages go to disk and `read_result` walks them."
             ),
         }
 
@@ -146,7 +182,9 @@ def _process_content(payload: dict[str, Any], fmt: str, budget: int | None) -> d
         return payload
 
     requested_url = str((payload.get("params") or {}).get("url") or "")
-    for result in results:
+    metadata = payload.get("metadata")
+    request_id = metadata.get("request_id") if isinstance(metadata, dict) else None
+    for index, result in enumerate(results):
         if not isinstance(result, dict):
             continue
         content = result.get(fmt)
@@ -157,7 +195,8 @@ def _process_content(payload: dict[str, Any], fmt: str, budget: int | None) -> d
         if len(content) <= budget:
             continue
         if _estimate_tokens(content) > budget:
-            _offload(result, content, _result_url(result) or requested_url, fmt, budget)
+            url = _result_url(result) or requested_url
+            _offload(result, content, url, fmt, budget, request_id, index)
     return payload
 
 
@@ -167,27 +206,37 @@ def _pop_screenshots(
     """Turn base64 screenshots into image content blocks the agent can actually look at.
 
     The API returns a PNG as a base64 string under `screenshot`. Left as text it is
-    thousands of useless tokens; as an MCP image the model sees the page. Locally the PNG
-    is also written to the spill dir so the user can open it.
+    thousands of useless tokens; as an MCP image the model sees the page.
     """
     body = envelope if body is None else body
-    images: list[Image] = []
-    for result in body.get("results") or []:
+    images = [image for _, image in _decode_screenshots(body, envelope.get("request_id"))]
+    return [envelope, *images] if images else envelope
+
+
+def _decode_screenshots(
+    body: dict[str, Any], request_id: Any = None
+) -> list[tuple[dict[str, Any], Image]]:
+    """Swap each base64 screenshot in `body` for a short info dict; return (info, image) pairs.
+
+    Locally the PNG is also written to the spill dir so the user can open it.
+    """
+    shots: list[tuple[dict[str, Any], Image]] = []
+    for index, result in enumerate(body.get("results") or []):
         if not isinstance(result, dict) or not isinstance(result.get("screenshot"), str):
             continue
         try:
             png = base64.b64decode(result["screenshot"], validate=True)
         except (ValueError, TypeError):
             continue  # Not what we expected; leave it for the agent to read as text.
-        images.append(Image(data=png, format="png"))
         info: dict[str, Any] = {"bytes": len(png), "note": "Returned as an image block."}
         if config.SPILL_ENABLED:
-            stem = hashlib.sha256((_result_url(result) or uuid.uuid4().hex).encode()).hexdigest()
-            path = _spill_dir() / f"{stem[:16]}.png"
+            stem = _spill_stem(_result_url(result) or uuid.uuid4().hex, request_id, index)
+            path = _spill_dir() / f"{stem}.png"
             path.write_bytes(png)
             info["path"] = str(path)
         result["screenshot"] = info
-    return [envelope, *images] if images else envelope
+        shots.append((info, Image(data=png, format="png")))
+    return shots
 
 
 def _visible_text(content: str, fmt: str) -> str:
@@ -225,7 +274,7 @@ def _flag_thin_content(payload: dict[str, Any]) -> dict[str, Any]:
             "This page returned no readable content, which usually means it renders "
             "client-side. Retry the same call with run_js=True — rendering takes "
             "30-150s, and a render that outlives the call comes back as a request id to "
-            "poll with `check_scrape`. If the page is "
+            "collect with `check_requests`. If the page is "
             "genuinely this short, take it at face value: do not retry twice, and do "
             "not fall back to your own recollection of what the page says."
         )

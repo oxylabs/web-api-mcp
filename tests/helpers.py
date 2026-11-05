@@ -6,12 +6,25 @@ from oxylabs_web_api_mcp import client, scraping
 
 GROUPS = {
     "scrapers": {
-        "json_not_supported": ["/v1/async/scrape/media"],
+        "json_not_supported": ["/v1/async/scrape/media", "/v1/async/scrape/batch/media"],
         "json_supported": [
             "/v1/scrape/amazon/product",
             "/v1/async/scrape/chatgpt",
+            "/v1/async/scrape/batch/amazon/product",
+            "/v1/async/scrape/batch/google/search",
+            "/v1/async/scrape/batch/google/trends/explore",
         ],
-        "json_supported_only_with_prompt_or_schema": ["/v1/scrape", "/v1/async/scrape"],
+        "json_supported_only_with_prompt_or_schema": [
+            "/v1/scrape",
+            "/v1/async/scrape",
+            "/v1/async/scrape/batch",
+        ],
+    }
+}
+
+SCHEMA = {
+    "properties": {
+        "output": {"type": "array", "items": {"enum": ["html", "screenshot", "markdown", "json"]}}
     }
 }
 
@@ -43,16 +56,30 @@ class _headers:
 
 
 class _api:
-    """Stub `_request`: answer each POST from `answers` in turn, and the parser groups."""
+    """Stub `_request`: answer each POST from `answers` in turn, the parser groups, endpoint
+    schemas (from `schemas`, keyed by path, else `SCHEMA`), and queued requests (from
+    `collected`, keyed by request id, else still pending; a callable is asked each time)."""
 
-    def __init__(self, *answers):
+    def __init__(self, *answers, schemas=None, collected=None):
         self.answers = list(answers)
+        self.schemas = schemas or {}
+        self.collected = collected or {}
         self.calls = []
 
     async def __call__(self, method, path, payload=None, **kwargs):
         if path.startswith("/v1/scrapers"):
             self.calls.append((method, path, None))
             return GROUPS
+        if method == "OPTIONS":
+            self.calls.append((method, path, None))
+            return self.schemas.get(path.split("?")[0], SCHEMA)
+        if method == "GET" and path.startswith("/v1/async/scrape/"):
+            self.calls.append((method, path, None))
+            answer = self.collected.get(path.rsplit("/", 1)[1], {"state": "pending"})
+            answer = answer() if callable(answer) else answer
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
         self.calls.append((method, path, payload))
         answer = self.answers.pop(0)
         if isinstance(answer, Exception):
@@ -65,11 +92,13 @@ class _api:
         self._real = client._request
         client._request = self
         scraping._JSON_GROUPS.clear()
+        scraping._OUTPUT_FORMATS.clear()
         return self
 
     def __exit__(self, *exc):
         client._request = self._real
         scraping._JSON_GROUPS.clear()
+        scraping._OUTPUT_FORMATS.clear()
         return False
 
     @property

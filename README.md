@@ -16,11 +16,11 @@ The tools and their behavior are the same on both options, and the sections on s
 | Tool | What it does |
 |---|---|
 | `search` | Search the live web, returns ranked organic results (title, description, URL) |
-| `scrape` | Read a single URL as **Markdown** by default, including JS-heavy and bot-protected pages. Ask for a screenshot, or pass `json_prompt` / `json_schema` to pull named fields off it as JSON |
-| `check_scrape` | Collect the result of a scrape the API is running in the background |
-| `read_scraped` | Read a large page that was offloaded to disk, in chunks (local stdio only) |
+| `scrape` | Read a URL, or a list of URLs, as **Markdown** by default, including JS-heavy and bot-protected pages. Ask for a screenshot, or pass `json_prompt` / `json_schema` to pull named fields off the page as JSON |
 | `list_scrapers` | List the scrape endpoints the API implements, grouped by parser support, or describe one's parameters |
-| `run_scraper` | Run a dedicated scrape endpoint with its own parameters, as content or as structured JSON |
+| `run_scraper` | Run a dedicated scrape endpoint with its own parameters, as content or as structured JSON; a list of `url`s or `query`s runs them all |
+| `check_requests` | Collect requests the API is running in the background, waiting for them to finish |
+| `read_result` | Read a page too long for one reply in parts, by its request id |
 
 All six are annotated `readOnlyHint` — nothing here writes anything, so clients can run
 them without prompting.
@@ -184,8 +184,8 @@ These variables apply to a server you run yourself. The Remote MCP server's sett
 |---|---|---|
 | `OXYLABS_WEB_API_KEY` | *(required on stdio)* | Web API key, sent as `Authorization: Bearer <key>`. Over HTTP a per-request `Authorization: Bearer` header takes precedence |
 | `OXYLABS_BASE_URL` | `https://webapi.oxylabs.io` | Override the API base URL, e.g. to go through a proxy |
-| `OXYLABS_RETRIES` | `2` | Retries on a transient 429/500/502/503/504 |
-| `OXYLABS_RATE_LIMIT` | *(off)* | Cap this server's own spend, e.g. `100/1h`, `50/30m` |
+| `OXYLABS_RETRIES` | `2` | Retries on a transient errors |
+| `OXYLABS_RATE_LIMIT` | *(off)* | Cap this server's own spend, e.g. `100/1h`, `50/30m`. Each item of a batch counts as one scrape |
 | `OXYLABS_MAX_INLINE_TOKENS` | `10000` | Above this, content is offloaded or truncated |
 | `OXYLABS_SPILL_DIR` | system temp | Where offloaded pages are written (stdio only) |
 | `OXYLABS_SPILL` | `1` | Set to `0` to keep everything inline even on stdio |
@@ -215,13 +215,17 @@ Oversized content is measured in **tokens, not characters**: 40 000 characters o
 
 ## Sync first, queued only on a timeout
 
-Every scrape goes to the synchronous endpoint first. If it times out, the same request is sent to the corresponding asynchronous endpoint (`/v1/async/...`) and the agent gets a request id to poll. `async/...` endpoints passed to `run_scraper` are always queued.
+Every scrape goes to the synchronous endpoint first. If it times out, the same request is sent to the corresponding asynchronous endpoint (`/v1/async/...`) and the agent gets a request id to collect. `async/...` endpoints passed to `run_scraper` are always queued.
 
 ```json
-{ "state": "pending", "request_id": "7504857924934611969", "note": "The synchronous call timed out (…), so the same request was queued instead. … call check_scrape('7504857924934611969') …" }
+{ "state": "pending", "request_id": "7504857924934611969", "note": "The synchronous call timed out (…), so the same request was queued instead. Collect it with check_requests(['7504857924934611969']) …" }
 ```
 
-The agent polls `check_scrape(request_id)` every 5s while it is pending. The API holds the result, so nothing about a request lives in this process: restarts and extra replicas do not lose it.
+`check_requests` waits for the request to finish (up to 30 s), reporting progress meanwhile, so the agent makes one call instead of polling in a loop it has no way to pace. The API holds the result, so nothing about a request lives in this process: restarts and extra replicas do not lose it.
+
+### Many pages in one call
+
+`scrape` takes a list of URLs, and `run_scraper` a list of `url`s or `query`s, when every other parameter is the same. Up to five run side by side through the synchronous endpoint; more go to the API's batch endpoint in one request, each item counting against `OXYLABS_RATE_LIMIT`. Either way the call waits for what was queued and answers with an item per URL or query: its state and, for as many as fit the token budget, its result. The rest come as summaries showing as much of each page as there was room for, and anything still running comes as a request id for `check_requests`.
 
 ### It says when a page needed rendering
 
@@ -253,10 +257,10 @@ To keep costs down, the server tries the dedicated parser first and falls back t
 
 Web pages routinely exceed what is sensible to hand an agent in one response, so `scrape` does not return oversized content inline:
 
-- **Running locally (stdio):** the page is written to a temp file. The agent gets the first 2 000 characters plus a path, and pulls the rest through `read_scraped(path, offset)` — reading only as far as it needs instead of paying for the whole page up front.
-- **Running over HTTP (Remote MCP or a self-hosted HTTP server):** there is no shared filesystem, so a path would be useless. The content is truncated with a note stating the full length.
+- **Running locally (stdio):** the page is written to a temp file, named by its request id. The agent gets the first 2 000 characters and pulls the rest through `read_result(request_id, page, offset)` — reading only as far as it needs instead of paying for the whole page up front.
+- **Running over HTTP (Remote MCP or a self-hosted HTTP server):** there is no shared filesystem. A queued result is read on in parts with the same `read_result`, straight from the API, which keeps it. A synchronous result is not kept by the API, so a page too long for one reply is cut short with a note stating its full length.
 
-The threshold is `OXYLABS_MAX_INLINE_TOKENS` (default 10 000). `read_scraped` can only read files in the spill directory — it is deliberately not a general file reader.
+The threshold is `OXYLABS_MAX_INLINE_TOKENS` (default 10 000). `read_result` reads only the files this server wrote to the spill directory, found by request id — it is deliberately not a general file reader.
 
 Full API documentation: **[Oxylabs Web API docs](https://developers.oxylabs.io/products/web-api)**
 
@@ -264,10 +268,10 @@ Full API documentation: **[Oxylabs Web API docs](https://developers.oxylabs.io/p
 
 - **Keep keys out of config files.** Use environment variables or a `.env` file outside version control, and don't commit client configs that contain a key.
 - **Callers can bring their own key over HTTP.** Send `Authorization: Bearer <key>` with each request and the server uses it for that call, so one deployment serves several callers on their own quota. `OXYLABS_WEB_API_KEY` in the server environment is the fallback when no header arrives.
-- **Cap the spend.** `OXYLABS_RATE_LIMIT=100/1h` refuses tool calls past a sliding window, so a runaway agent loop cannot drain the key. Off by default.
+- **Cap the spend.** `OXYLABS_RATE_LIMIT=100/1h` refuses scrapes past a sliding window, so a runaway agent loop cannot drain the key; each URL or query of a list counts. Off by default. Separately, one call takes at most 50 URLs or queries.
 - **If you rely on that fallback, treat the endpoint as privileged.** The server does no authentication of its own — anyone who can reach it spends the key it holds. Put it behind your VPN, an ingress with auth, or a service mesh. Don't expose it to the public internet.
 - `scrape` fetches whatever URL it is given. If you expose this server to untrusted prompts, restrict egress at the network layer rather than trusting the caller.
-- `read_scraped` is restricted to the spill directory. Don't point `OXYLABS_SPILL_DIR` at a directory holding anything else — it would make those files readable by the agent.
+- `read_result` is restricted to the spill directory. Don't point `OXYLABS_SPILL_DIR` at a directory holding anything else — it would make those files readable by the agent.
 
 ## Development
 
