@@ -52,13 +52,21 @@ def _parse_rate_limit(spec: str) -> tuple[int, float] | None:
 _load_env_file()
 
 BASE_URL = os.environ.get("OXYLABS_BASE_URL", "https://webapi.oxylabs.io").rstrip("/")
+# A synchronous scrape can take minutes to answer; making the connection should not.
 HTTP_TIMEOUT = 200
+CONNECT_TIMEOUT = 15
 POLL_SECONDS = 5
+# How often a long call tells the client it is still working, so a client that resets its
+# request timeout on progress keeps waiting.
+HEARTBEAT_SECONDS = 10
 
 # Token budget, not chars: major clients reject a tool result over 25k tokens.
 MAX_INLINE_TOKENS = int(os.environ.get("OXYLABS_MAX_INLINE_TOKENS", "10000"))
 READ_CHUNK_CHARS = 40000
 PREVIEW_CHARS = 2000
+# Room a reply keeps for what is added after its content is fitted: the parser's label and
+# note, and the empty-page hint.
+REPLY_RESERVE_TOKENS = 300
 
 RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
 QUEUE_RETRY_STATUS = frozenset({429, 503})
@@ -76,6 +84,10 @@ PERMANENT_FAULTS = frozenset(
 PERMANENT_FAULT_PREFIXES = ("DOWNLOAD_FAILED_",)
 RETRIES = int(os.environ.get("OXYLABS_RETRIES", "2"))
 RETRY_BASE_DELAY = 1.0
+# A rate limit takes longer to clear than a hiccup: its backoff starts this many times
+# higher. A `Retry-After` up to the cap is waited out; a longer one is reported instead.
+RATE_LIMIT_BACKOFF_FACTOR = 2
+MAX_RETRY_AFTER_SECONDS = 30
 
 BATCH_LIMIT = 50
 BATCH_INPUT_PARAMS = ("url", "query")
@@ -83,7 +95,12 @@ MAX_PARALLEL_SYNC_SCRAPES = 5
 MAX_WAIT_FOR_QUEUED_SECONDS = 30
 CHECK_REQUESTS_LIMIT = 50
 CHECK_REQUESTS_PULL_LIMIT = 10
+
 MAX_SCREENSHOTS_PER_REPLY = 5
+# Model APIs refuse bigger images (8000 px a side; 5 MB of base64 on Amazon Bedrock), so a
+# screenshot over either limit is not sent as an image.
+MAX_SCREENSHOT_SIDE_PX = 8000
+MAX_SCREENSHOT_BYTES = 3_750_000
 
 RATE_LIMIT = _parse_rate_limit(os.environ.get("OXYLABS_RATE_LIMIT", ""))
 
@@ -105,6 +122,9 @@ JSON_PARAM = "json"
 JSON_NOT_SUPPORTED = "json_not_supported"
 JSON_SUPPORTED = "json_supported"  # dedicated parser, and the AI parser with a prompt or schema
 JSON_GROUPS_TTL_SECONDS = 3600
+# Bounds on what is cached per API key, so a shared server does not grow with every key.
+MAX_CACHED_KEYS = 256
+MAX_CACHED_SCHEMAS = 2048
 
 # Endpoint names come from `GET /v1/scrapers` as slash-separated source paths
 # (`scrape/amazon/search`). Each segment is validated on its own, so a caller

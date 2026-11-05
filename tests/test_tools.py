@@ -12,7 +12,7 @@ from helpers import GROUPS, _api, _done, _pending, _stub_client
 
 from oxylabs_web_api_mcp import app, client, config, results, scraping, skill, tools
 from oxylabs_web_api_mcp.content import _estimate_tokens
-from oxylabs_web_api_mcp.errors import ApiError, ApiFaulted, ApiTimeout
+from oxylabs_web_api_mcp.errors import ApiError, ApiFaulted, ApiNotFound, ApiTimeout
 from oxylabs_web_api_mcp.tools import (
     check_requests,
     list_scrapers,
@@ -129,7 +129,7 @@ def test_check_requests_collects_a_single_request():
         "params": {"url": "https://ex.com", "output": ["markdown"]},
         "metadata": {"request_id": "7504857924934611969"},
     }
-    gone = ApiError("/v1/async/scrape/404404 returned 404: Query not found.")
+    gone = ApiNotFound("/v1/async/scrape/404404 returned 404: Query not found.")
     with _api(collected={"7504857924934611969": done, "404404": gone}) as api:
         pending = asyncio.run(check_requests(["111"]))
         assert pending["items"] == [{"request_id": "111", "state": "pending"}], pending
@@ -207,7 +207,7 @@ def test_check_requests_reports_each_request():
             "results": [{"markdown": "real text " * 100}],
             "metadata": {"request_id": "2"},
         },
-        "3": ApiError("/v1/async/scrape/3 returned 404: Not found."),
+        "3": ApiNotFound("/v1/async/scrape/3 returned 404: Not found."),
     }
     with _api(collected=collected) as api:
         out = asyncio.run(check_requests(["1", "2", "3", "2"]))
@@ -845,7 +845,7 @@ def test_read_result_fits_its_reply_to_the_token_budget(monkeypatch):
 def test_read_result_explains_what_it_cannot_read(monkeypatch):
     monkeypatch.setattr(config, "SPILL_ENABLED", False)
     shot = {"state": "done", "params": {"output": ["screenshot"]}, "results": [{"screenshot": "x"}]}
-    gone = ApiError("/v1/async/scrape/8 returned 404: Not found.")
+    gone = ApiNotFound("/v1/async/scrape/8 returned 404: Not found.")
     with _api(collected={"7": shot, "8": gone, "9": {"state": "pending"}}):
         for request_id, reason in (
             ("7", "a screenshot is an image"),

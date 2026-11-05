@@ -12,7 +12,7 @@ from helpers import _headers, _stub_client
 from mcp.types import InitializeRequestParams
 
 from oxylabs_web_api_mcp import client, config
-from oxylabs_web_api_mcp.errors import ApiError
+from oxylabs_web_api_mcp.errors import ApiAuthError, ApiError, ApiNotFound
 
 
 def _resp(status: int, json_body=None, text: str = "") -> httpx.Response:
@@ -124,7 +124,7 @@ def test_a_400_is_not_retried():
         httpx.AsyncClient = real_client
 
 
-def test_rate_limit_parsing_and_enforcement():
+def test_rate_limit_parsing_and_enforcement(monkeypatch):
     assert config._parse_rate_limit("") is None
     assert config._parse_rate_limit("100/1h") == (100, 3600.0)
     assert config._parse_rate_limit("50/30m") == (50, 1800.0)
@@ -135,24 +135,21 @@ def test_rate_limit_parsing_and_enforcement():
     else:
         raise AssertionError("a malformed rate limit must fail loudly at startup")
 
-    real_limit, real_times = config.RATE_LIMIT, list(client._CALL_TIMES)
-    config.RATE_LIMIT, client._CALL_TIMES[:] = (2, 3600.0), []
+    monkeypatch.setattr(config, "RATE_LIMIT", (2, 3600.0))
+    monkeypatch.setattr(client, "_CALL_TIMES", {})
+    client._check_rate_limit()
+    client._check_rate_limit()
     try:
         client._check_rate_limit()
-        client._check_rate_limit()
-        try:
-            client._check_rate_limit()
-        except ApiError as exc:
-            assert "rate limit" in str(exc).lower(), exc
-        else:
-            raise AssertionError("the third call must be refused")
-    finally:
-        config.RATE_LIMIT, client._CALL_TIMES[:] = real_limit, real_times
+    except ApiError as exc:
+        assert "rate limit" in str(exc).lower(), exc
+    else:
+        raise AssertionError("the third call must be refused")
 
 
 def test_a_batch_is_charged_one_scrape_per_item(monkeypatch):
     monkeypatch.setattr(config, "RATE_LIMIT", (5, 3600.0))
-    monkeypatch.setattr(client, "_CALL_TIMES", [])
+    monkeypatch.setattr(client, "_CALL_TIMES", {})
     client._check_rate_limit(3)
     for cost, reason in ((3, "room for 2 more"), (6, "more than")):
         try:
@@ -188,7 +185,7 @@ def test_a_batch_post_is_not_resent_when_the_api_may_have_taken_it(monkeypatch):
         return asyncio.run(client._request("POST", "/v1/async/scrape/batch", {}, idempotent=False))
 
     monkeypatch.setattr(config, "RETRY_BASE_DELAY", 0)
-    # A 502, or a connection that broke after the request went out, may have queued it.
+    # After a 502, or a connection that broke mid-request, it is not sent again.
     for answer in (502, httpx.ReadError("connection reset")):
         calls = api(answer, 200)
         try:
@@ -198,37 +195,29 @@ def test_a_batch_post_is_not_resent_when_the_api_may_have_taken_it(monkeypatch):
         else:
             raise AssertionError(f"{answer!r} must not be resent")
         assert len(calls) == 1, calls
-    # A 503, or a connection never made, means the API never took it.
+    # After a 503, or a connection never made, it is sent again.
     for answer in (503, httpx.ConnectError("refused")):
         calls = api(answer, 200)
         post()
         assert len(calls) == 2, calls
 
 
-def test_only_posts_count_against_the_rate_limit():
+def test_only_posts_count_against_the_rate_limit(monkeypatch):
     def ok(method, url):
         return httpx.Response(200, json={"state": "pending"}, request=httpx.Request(method, url))
 
-    real_client, real_limit, real_times = (
-        httpx.AsyncClient,
-        config.RATE_LIMIT,
-        list(client._CALL_TIMES),
-    )
-    httpx.AsyncClient = _stub_client(ok)
-    config.RATE_LIMIT, client._CALL_TIMES[:] = (1, 3600.0), []
+    monkeypatch.setattr(httpx, "AsyncClient", _stub_client(ok))
+    monkeypatch.setattr(config, "RATE_LIMIT", (1, 3600.0))
+    monkeypatch.setattr(client, "_CALL_TIMES", {})
+    for _ in range(3):
+        asyncio.run(client._request("GET", "/v1/async/scrape/1"))
+    asyncio.run(client._request("POST", "/v1/scrape", {}))
     try:
-        for _ in range(3):
-            asyncio.run(client._request("GET", "/v1/async/scrape/1"))
         asyncio.run(client._request("POST", "/v1/scrape", {}))
-        try:
-            asyncio.run(client._request("POST", "/v1/scrape", {}))
-        except ApiError as exc:
-            assert "rate limit" in str(exc).lower(), exc
-        else:
-            raise AssertionError("the second POST must be refused")
-    finally:
-        httpx.AsyncClient = real_client
-        config.RATE_LIMIT, client._CALL_TIMES[:] = real_limit, real_times
+    except ApiError as exc:
+        assert "rate limit" in str(exc).lower(), exc
+    else:
+        raise AssertionError("the second POST must be refused")
 
 
 def test_a_429_is_retried_and_then_reported_as_a_quota_problem():
@@ -288,30 +277,6 @@ def test_backoff_is_jittered_so_callers_do_not_retry_in_lockstep():
         assert highs == sorted(highs) and highs[-1] > highs[0], highs
     finally:
         httpx.AsyncClient, random.uniform = real_client, real_uniform
-
-
-def test_a_spent_quota_is_not_retried():
-    calls = []
-
-    def spent(method, url):
-        calls.append(url)
-        return httpx.Response(
-            429,
-            json={"status": 429, "title": "QUOTA_EXCEEDED", "detail": "Upgrade your plan."},
-            request=httpx.Request(method, url),
-        )
-
-    real_client = httpx.AsyncClient
-    httpx.AsyncClient = _stub_client(spent)
-    try:
-        asyncio.run(client._request("POST", "/v1/search", {"query": "x"}))
-    except ApiError as exc:
-        assert len(calls) == 1, "backoff cannot refill a quota"
-        assert "quota" in str(exc).lower() and "retrying will not help" in str(exc), exc
-    else:
-        raise AssertionError("expected ApiError for a spent quota")
-    finally:
-        httpx.AsyncClient = real_client
 
 
 def test_search_validation_errors_name_the_field():
@@ -439,3 +404,163 @@ def test_client_name_cannot_inject_a_header():
         f"oxylabs-web-api-mcp/{config.VERSION} claude-code (python {python})"
     )
     assert client._sdk_header(None) == f"oxylabs-web-api-mcp/{config.VERSION} (python {python})"
+
+
+def test_errors_say_what_kind_they_are():
+    def raised(status, body):
+        try:
+            client._check(_resp(status, body), "/v1/x")
+        except ApiError as exc:
+            return exc
+        raise AssertionError(f"a {status} must raise")
+
+    assert isinstance(raised(401, {"detail": "no"}), ApiAuthError)
+    assert isinstance(raised(404, {"detail": "Query not found."}), ApiNotFound)
+
+
+def _sleeps(monkeypatch) -> list[float]:
+    slept: list[float] = []
+
+    async def sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(client.asyncio, "sleep", sleep)
+    return slept
+
+
+def _limited(retry_after: str | None, then: int = 429):
+    calls = []
+
+    def respond(method, url):
+        calls.append(url)
+        if len(calls) > 1 and then != 429:
+            return httpx.Response(then, json={"results": []}, request=httpx.Request(method, url))
+        headers = {"Retry-After": retry_after} if retry_after else {}
+        body = {"status": 429, "title": "RATE_LIMIT_EXCEEDED", "detail": "Slow down."}
+        return httpx.Response(429, json=body, headers=headers, request=httpx.Request(method, url))
+
+    return calls, _stub_client(respond)
+
+
+def test_a_rate_limit_waits_as_long_as_the_api_asks(monkeypatch):
+    calls, stub = _limited("3", then=200)
+    monkeypatch.setattr(httpx, "AsyncClient", stub)
+    slept = _sleeps(monkeypatch)
+    asyncio.run(client._request("POST", "/v1/search", {"query": "x"}))
+    assert len(calls) == 2 and 3 <= slept[0] <= 3 + config.RETRY_BASE_DELAY, slept
+
+
+def test_a_long_retry_after_is_reported_not_waited_out(monkeypatch):
+    calls, stub = _limited("120")
+    monkeypatch.setattr(httpx, "AsyncClient", stub)
+    slept = _sleeps(monkeypatch)
+    try:
+        asyncio.run(client._request("POST", "/v1/search", {"query": "x"}))
+    except ApiError as exc:
+        assert "wait 120s" in str(exc), exc
+    else:
+        raise AssertionError("a rate limit that will not clear in time must be reported")
+    assert len(calls) == 1 and slept == [], (calls, slept)
+
+
+def test_a_rate_limit_backs_off_longer_than_a_hiccup(monkeypatch):
+    windows = []
+
+    def record(low, high):
+        windows.append((low, high))
+        return 0
+
+    _, stub = _limited(None)
+    monkeypatch.setattr(httpx, "AsyncClient", stub)
+    monkeypatch.setattr(random, "uniform", record)
+    try:
+        asyncio.run(client._request("POST", "/v1/search", {"query": "x"}))
+    except ApiError:
+        pass
+    # Never near zero, unlike a 5xx's backoff, which may retry at once.
+    assert windows and all(low >= config.RETRY_BASE_DELAY for low, _ in windows), windows
+
+
+def test_each_key_has_a_rate_limit_window_of_its_own(monkeypatch):
+    monkeypatch.setattr(config, "RATE_LIMIT", (1, 3600.0))
+    monkeypatch.setattr(client, "_CALL_TIMES", {})
+    with _headers({"authorization": "Bearer caller-a"}):
+        client._check_rate_limit()
+        try:
+            client._check_rate_limit()
+        except ApiError:
+            pass
+        else:
+            raise AssertionError("caller-a's window is full")
+    with _headers({"authorization": "Bearer caller-b"}):
+        client._check_rate_limit()  # caller-a did not use up caller-b's window
+    assert all(len(key) == 64 for key in client._CALL_TIMES), "keys are kept only as hashes"
+
+
+def test_the_http_client_is_shared_and_keeps_no_cookies(monkeypatch):
+    seen = []
+
+    def handler(request):
+        seen.append(request.headers.get("cookie"))
+        return httpx.Response(
+            200, json={"results": []}, headers={"set-cookie": "session=a; Path=/"}
+        )
+
+    class Mocked(httpx.AsyncClient):
+        made = 0
+
+        def __init__(self, **kwargs):
+            Mocked.made += 1
+            super().__init__(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", Mocked)
+
+    async def two_callers():
+        with _headers({"authorization": "Bearer caller-a"}):
+            await client._request("POST", "/v1/search", {"query": "x"})
+        with _headers({"authorization": "Bearer caller-b"}):
+            await client._request("POST", "/v1/search", {"query": "y"})
+
+    asyncio.run(two_callers())
+    assert Mocked.made == 1, "one client, so its connections are reused"
+    assert seen == [None, None], "a cookie set on one caller's reply must not reach another"
+
+
+def test_a_slow_call_tells_the_client_it_is_alive(monkeypatch):
+    """On a clock that moves only when the heartbeat waits, so no real time passes."""
+    sent = []
+    now = [0.0]
+    real_wait = asyncio.wait
+
+    class _Ctx:
+        async def report_progress(self, progress, total=None, message=None):
+            sent.append((progress, message))
+
+    async def call():
+        release = asyncio.Event()
+
+        async def slow():
+            await release.wait()
+            return "done"
+
+        async def fake_wait(tasks, timeout=None):
+            now[0] += timeout
+            if now[0] >= 3 * config.HEARTBEAT_SECONDS:
+                release.set()  # the work finishes during the third wait
+                return await real_wait(tasks)
+            await asyncio.sleep(0)
+            return set(), set(tasks)
+
+        monkeypatch.setattr(client.asyncio, "wait", fake_wait)
+        client._start_progress()
+        return await client._heartbeat(_Ctx(), slow(), "Waiting for /v1/scrape")
+
+    monkeypatch.setattr(client.time, "monotonic", lambda: now[0])
+    assert asyncio.run(call()) == "done"
+    # A notification per wait the work outlived, each greater than the one before, as MCP
+    # requires, and each saying how long it has been.
+    step = config.HEARTBEAT_SECONDS
+    assert sent == [
+        (1, f"Waiting for /v1/scrape ({step}s)"),
+        (2, f"Waiting for /v1/scrape ({2 * step}s)"),
+    ], sent

@@ -30,13 +30,7 @@ SCHEMA = {
 
 
 class _FakeCtx:
-    """Just enough of a FastMCP Context for the bits that log."""
-
-    def __init__(self):
-        self.messages = []
-
-    async def info(self, message):
-        self.messages.append(message)
+    """A stand-in for a FastMCP Context, for the code paths that take one."""
 
 
 class _headers:

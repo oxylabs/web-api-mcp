@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import httpx
-from helpers import _api, _done, _FakeCtx, _pending, _stub_client
+from helpers import _api, _done, _FakeCtx, _headers, _pending, _stub_client
 
 from oxylabs_web_api_mcp import client, config, scraping
+from oxylabs_web_api_mcp.content import _estimate_tokens
 from oxylabs_web_api_mcp.errors import ApiError, ApiFaulted, ApiTimeout
 from oxylabs_web_api_mcp.tools import run_scraper, scrape
 
@@ -32,23 +34,57 @@ def test_a_sync_timeout_is_sent_to_the_async_endpoint():
     assert "params" not in out and "metadata" not in out
 
 
-def test_a_gateway_timeout_on_sync_is_retried_not_queued():
+def _slow_sync(answer):
+    """The sync endpoint answers with `answer` (a status, or an exception to raise); the
+    async one queues the request."""
     calls = []
 
-    def gateway_timeout(method, url):
-        calls.append(url)
-        if len(calls) == 1:
-            return httpx.Response(504, text="Gateway Timeout", request=httpx.Request(method, url))
-        done = {"state": "done", "results": [{"markdown": "x" * 600}], "params": {}}
-        return httpx.Response(200, json=done, request=httpx.Request(method, url))
+    def respond(method, url):
+        calls.append(url.rsplit("/v1/", 1)[1])
+        if url.endswith("/v1/scrape"):
+            if isinstance(answer, Exception):
+                raise answer
+            return httpx.Response(
+                answer, text="Gateway Timeout", request=httpx.Request(method, url)
+            )
+        queued = {"state": "pending", "metadata": {"request_id": "7500000000000000009"}}
+        return httpx.Response(202, json=queued, request=httpx.Request(method, url))
 
-    real_client, real_delay = httpx.AsyncClient, config.RETRY_BASE_DELAY
-    httpx.AsyncClient, config.RETRY_BASE_DELAY = _stub_client(gateway_timeout), 0
-    try:
-        asyncio.run(scrape("https://ex.com"))
-    finally:
-        httpx.AsyncClient, config.RETRY_BASE_DELAY = real_client, real_delay
-    assert [u.rsplit("/v1/", 1)[1] for u in calls] == ["scrape", "scrape"], calls
+    return calls, _stub_client(respond)
+
+
+def test_a_gateway_timeout_on_sync_is_queued_not_resent(monkeypatch):
+    # A scrape that outlived the gateway once would outlive it again: resending it to the
+    # sync endpoint only doubles the wait, so it goes to the queue like the API's own timeout.
+    calls, stub = _slow_sync(504)
+    monkeypatch.setattr(httpx, "AsyncClient", stub)
+    monkeypatch.setattr(config, "RETRY_BASE_DELAY", 0)
+    out = asyncio.run(scrape("https://ex.com", run_js=True))
+    assert calls == ["scrape", "async/scrape"], calls
+    assert out["request_id"] == "7500000000000000009" and "timed out" in out["note"], out
+
+
+def test_a_sync_scrape_that_never_answers_is_queued(monkeypatch):
+    calls, stub = _slow_sync(httpx.ReadTimeout("no answer"))
+    monkeypatch.setattr(httpx, "AsyncClient", stub)
+    out = asyncio.run(scrape("https://ex.com", run_js=True))
+    assert calls == ["scrape", "async/scrape"], calls
+    assert out["state"] == "pending" and "check_requests" in out["note"], out
+
+
+def test_a_slow_gateway_elsewhere_is_still_retried(monkeypatch):
+    # Only the sync scrape treats a 504 as its own timeout; a search just tries again.
+    calls = []
+
+    def flaky(method, url):
+        calls.append(url)
+        status = 504 if len(calls) == 1 else 200
+        return httpx.Response(status, json={"results": []}, request=httpx.Request(method, url))
+
+    monkeypatch.setattr(httpx, "AsyncClient", _stub_client(flaky))
+    monkeypatch.setattr(config, "RETRY_BASE_DELAY", 0)
+    asyncio.run(client._request("POST", "/v1/search", {"query": "x"}))
+    assert len(calls) == 2, calls
 
 
 def test_run_scraper_runs_sync_even_with_run_js_and_queues_async_endpoints():
@@ -398,7 +434,7 @@ def test_run_scraper_sends_batch_endpoints_to_the_endpoint_itself():
 
 
 def test_a_queued_post_is_not_resent_when_the_api_may_have_taken_it(monkeypatch):
-    """The API queues a job before it writes the reply: a failed reply may follow a job."""
+    """A queued POST is resent only after a 429 or a 503; any other failure is reported."""
 
     def api(*statuses):
         calls = []
@@ -425,7 +461,7 @@ def test_a_queued_post_is_not_resent_when_the_api_may_have_taken_it(monkeypatch)
         else:
             raise AssertionError(f"a {status} must not be resent")
         assert calls == [status], calls
-    # A 429 or a 503 comes before anything is queued, so it is resent.
+    # After a 429 or a 503 it is sent again.
     for status in (429, 503):
         calls = api(status, 202)
         assert queue()["request_id"] == "7500000000000000009"
@@ -470,3 +506,33 @@ def test_a_json_prompt_and_a_json_schema_are_not_sent_together():
             else:
                 raise AssertionError("a prompt and a schema together must be refused")
         assert api.posts == [], api.posts
+
+
+def test_json_asked_for_beside_other_formats_keeps_them():
+    with _api(lambda p: _done(p, json={"t": 1}, markdown="word " * 200)) as api:
+        asyncio.run(
+            run_scraper("scrape/amazon/product", {"query": "B0", "output": ["markdown", "json"]})
+        )
+    assert api.posts[0][1]["output"] == ["markdown", "json"], api.posts
+
+
+def test_a_large_dedicated_parse_comes_back_within_the_budget(monkeypatch):
+    monkeypatch.setattr(config, "SPILL_ENABLED", False)
+    big = {
+        "reviews": [{"title": f"Review {n}", "content": "Great product. " * 40} for n in range(400)]
+    }
+    with _api(lambda p: {**_done(p, json=big), "metadata": {"request_id": "1"}}) as api:
+        out = asyncio.run(run_scraper("scrape/amazon/product", {"query": "B0"}))
+    assert _estimate_tokens(json.dumps(out, ensure_ascii=False)) <= config.MAX_INLINE_TOKENS
+    # Cut to fit is not empty: the dedicated parse stands, and the AI parser is not run.
+    assert len(api.posts) == 1 and out["parser"] == "dedicated"
+    assert "content_truncated" in out["results"][0]
+
+
+def test_the_per_key_caches_stay_bounded(monkeypatch):
+    monkeypatch.setattr(config, "MAX_CACHED_KEYS", 2)
+    with _api():
+        for key in ("a", "b", "c"):
+            with _headers({"authorization": f"Bearer {key}"}):
+                asyncio.run(scraping._scraper_groups(None))
+        assert len(scraping._JSON_GROUPS) == 2

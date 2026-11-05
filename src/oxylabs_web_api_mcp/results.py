@@ -4,9 +4,7 @@ read in parts."""
 from __future__ import annotations
 
 import asyncio
-import json
 import time
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,9 +12,11 @@ from fastmcp import Context
 
 from . import client, config
 from .content import (
+    _as_text,
     _decode_screenshots,
     _estimate_tokens,
     _flag_thin_content,
+    _longest,
     _output_format,
     _request_id,
     _result_url,
@@ -24,6 +24,8 @@ from .content import (
     _spill_dir,
     _spill_path,
     _token_budget,
+    _tokens,
+    _tokens_within,
     _trim,
 )
 from .errors import ApiError, ApiFaulted, ApiNotFound, ApiTimeout
@@ -32,6 +34,7 @@ from .scraping import (
     _dedicated_note,
     _extract,
     _is_queued,
+    _json_output,
     _json_support,
     _label,
     _parser_of,
@@ -79,13 +82,11 @@ async def _collect(request_id: str, ctx: Context | None) -> dict[str, Any]:
                 params=exc.params,
             ) from exc
         raise
-    except ApiError as exc:
-        if "returned 404" in str(exc):
-            raise ApiNotFound(
-                f"No request {request_id!r}: the API does not know this request id. Either it "
-                "expired or it was never a valid one. Start it again."
-            ) from exc
-        raise
+    except ApiNotFound as exc:
+        raise ApiNotFound(
+            f"No request {request_id!r}: the API does not know this request id. Either it "
+            "expired or it was never a valid one. Start it again."
+        ) from exc
 
 
 def _finished(body: dict[str, Any]) -> dict[str, Any]:
@@ -97,7 +98,7 @@ def _finished(body: dict[str, Any]) -> dict[str, Any]:
     result.pop("request_id", None)  # the item carries it
     item: dict[str, Any] = {"state": "done", "result": result}
     if failure:
-        _label(item, parser, f"The dedicated parser failed ({failure}); {PARSER_RETRY}.")
+        _label(item, parser, f"The dedicated parser did not succeed ({failure}); {PARSER_RETRY}.")
     elif parser == "dedicated":
         _label(item, parser, _dedicated_note(result, PARSER_RETRY))
     elif parser == "ai":
@@ -157,7 +158,7 @@ async def _wait(entries: list[_Entry], ctx: Context | None, strict: bool = False
         first = False
         left = sum(1 for entry in entries if entry.pending)
         done = len(entries) - left
-        await client._progress(ctx, done, len(entries), f"{done} of {len(entries)} finished")
+        await client._progress(ctx, f"{done} of {len(entries)} finished")
         if not left or time.monotonic() + config.POLL_SECONDS > deadline:
             return
         await asyncio.sleep(config.POLL_SECONDS)
@@ -360,48 +361,6 @@ def _results_note(summarized: int, finished: int, unreadable: bool) -> str:
     return note
 
 
-def _as_text(value: Any) -> str:
-    return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
-
-
-def _tokens(value: Any) -> int:
-    """What `value` costs in a reply, as JSON."""
-    return _estimate_tokens(json.dumps(value, ensure_ascii=False, default=str))
-
-
-def _tokens_within(text: str, budget: int) -> int | None:
-    """`text`'s estimated tokens, or None when that is over `budget`.
-
-    A token covers at most about four characters, so a text over four times the budget is
-    turned down by its length alone, without scanning every character.
-    """
-    if (len(text) + 3) // 4 > budget:
-        return None
-    tokens = _estimate_tokens(text)
-    return tokens if tokens <= budget else None
-
-
-def _longest(limit: int, fits: Callable[[int], bool]) -> int:
-    """The largest length up to `limit` that `fits`, given that every shorter one fits too."""
-    low, high = 0, limit
-    while low < high:
-        middle = (low + high + 1) // 2
-        if fits(middle):
-            low = middle
-        else:
-            high = middle - 1
-    return low
-
-
-def _prefix_within(text: str, budget: int) -> int:
-    """The length of the longest start of `text` that costs at most `budget` in a reply."""
-    if _tokens([text]) <= budget:
-        return len(text)
-    return _longest(
-        min(len(text), 4 * budget + 4), lambda length: _tokens([text[:length]]) <= budget
-    )
-
-
 async def _page_text(request_id: str, page: int, ctx: Context | None) -> tuple[str, str]:
     """A result page's whole text and its format: from disk when written there, else the API.
 
@@ -409,16 +368,19 @@ async def _page_text(request_id: str, page: int, ctx: Context | None) -> tuple[s
     """
     if config.SPILL_ENABLED:
         for path in sorted(_spill_dir().glob(f"{request_id}-{page}.*.txt")):
+            if path.is_symlink():
+                continue  # this server never writes one
             text = path.read_text(encoding="utf-8", errors="replace")
             return text, _FORMATS_BY_EXT.get(path.name.split(".")[-2], "html")
+    sync_note = (
+        "The API keeps the results of queued requests only: a page from a synchronous "
+        "scrape can be read on only where this server wrote it to disk, so run that scrape "
+        "again on its own for more of it."
+    )
     try:
         body = await _collect(request_id, ctx)
     except ApiNotFound as exc:
-        raise ApiNotFound(
-            f"{exc} The API keeps the results of queued requests only: a page from a "
-            "synchronous scrape can be read on only where this server wrote it to disk, so "
-            "run that scrape again on its own for more of it."
-        ) from exc
+        raise ApiNotFound(f"{exc} {sync_note}") from exc
     if client._state(body) != "done":
         raise ApiError(
             f"Request {request_id!r} has not finished. Collect it with check_requests first."
@@ -454,12 +416,16 @@ async def _scrape_many(
     """Scrape several URLs or queries that share every other parameter, in one reply.
 
     Up to `MAX_PARALLEL_SYNC_SCRAPES` run side by side through the synchronous endpoint,
-    as a call each would; more go to the endpoint's batch in one request. What is queued
-    is then waited for, so most lists come back finished. `extract` is the parser, prompt
-    and schema when JSON is wanted.
+    as a call each would, the client hearing while they run that the call is alive; more go
+    to the endpoint's batch in one request. What is queued is then waited for, so most lists
+    come back finished. `extract` is the parser, prompt and schema when JSON is wanted.
     """
     if len(inputs) <= config.MAX_PARALLEL_SYNC_SCRAPES:
-        entries = await _run_each(name, key, inputs, common, extract, ctx)
+        entries = await client._heartbeat(
+            ctx,
+            _run_each(name, key, inputs, common, extract, ctx),
+            f"Waiting for {len(inputs)} {'pages' if key == 'url' else 'requests'}",
+        )
     else:
         entries = await _run_batch(name, key, inputs, common, extract, ctx)
     errors = [entry.error for entry in entries]
@@ -518,7 +484,7 @@ async def _run_batch(
     payload = {key: inputs, **common}
     if extract is not None:
         payload = await _batch_json(batch, payload, *extract, ctx)
-    await client._note(ctx, f"Queueing a batch of {len(inputs)} on {path}")
+    client._note(f"Queueing a batch of {len(inputs)} on {path}")
     body = await client._request("POST", path, payload, ctx=ctx, idempotent=False, cost=len(inputs))
 
     # The API echoes each request's full params; the item is the one it was queued for.
@@ -567,7 +533,7 @@ async def _batch_json(
             "and read the content instead."
         )
     base = {k: v for k, v in payload.items() if k != config.JSON_PARAM}
-    base[config.OUTPUT_PARAM] = ["json"]
+    base[config.OUTPUT_PARAM] = _json_output(payload.get(config.OUTPUT_PARAM))
     spec = {k: v for k, v in (("prompt", prompt), ("schema", schema)) if v}
     if parser == "auto" and (group == config.JSON_SUPPORTED or (group is None and not spec)):
         return base
