@@ -150,6 +150,61 @@ def test_rate_limit_parsing_and_enforcement():
         config.RATE_LIMIT, client._CALL_TIMES[:] = real_limit, real_times
 
 
+def test_a_batch_is_charged_one_scrape_per_item(monkeypatch):
+    monkeypatch.setattr(config, "RATE_LIMIT", (5, 3600.0))
+    monkeypatch.setattr(client, "_CALL_TIMES", [])
+    client._check_rate_limit(3)
+    for cost, reason in ((3, "room for 2 more"), (6, "more than")):
+        try:
+            client._check_rate_limit(cost)
+        except ApiError as exc:
+            assert reason in str(exc), exc
+        else:
+            raise AssertionError(f"a batch of {cost} must be refused")
+    client._check_rate_limit(2)  # fills the window exactly
+    try:
+        client._check_rate_limit()
+    except ApiError as exc:
+        assert "exhausted" in str(exc), exc
+    else:
+        raise AssertionError("a full window must refuse even one more scrape")
+
+
+def test_a_batch_post_is_not_resent_when_the_api_may_have_taken_it(monkeypatch):
+    def api(*answers):
+        calls = []
+
+        def respond(method, url):
+            answer = answers[min(len(calls), len(answers) - 1)]
+            calls.append(answer)
+            if isinstance(answer, Exception):
+                raise answer
+            return httpx.Response(answer, json={"data": []}, request=httpx.Request(method, url))
+
+        monkeypatch.setattr(httpx, "AsyncClient", _stub_client(respond))
+        return calls
+
+    def post():
+        return asyncio.run(client._request("POST", "/v1/async/scrape/batch", {}, idempotent=False))
+
+    monkeypatch.setattr(config, "RETRY_BASE_DELAY", 0)
+    # A 502, or a connection that broke after the request went out, may have queued it.
+    for answer in (502, httpx.ReadError("connection reset")):
+        calls = api(answer, 200)
+        try:
+            post()
+        except ApiError as exc:
+            assert "may have been queued" in str(exc), exc
+        else:
+            raise AssertionError(f"{answer!r} must not be resent")
+        assert len(calls) == 1, calls
+    # A 503, or a connection never made, means the API never took it.
+    for answer in (503, httpx.ConnectError("refused")):
+        calls = api(answer, 200)
+        post()
+        assert len(calls) == 2, calls
+
+
 def test_only_posts_count_against_the_rate_limit():
     def ok(method, url):
         return httpx.Response(200, json={"state": "pending"}, request=httpx.Request(method, url))

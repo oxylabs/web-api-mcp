@@ -2,33 +2,25 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from fastmcp import Context
 from pydantic import Field
 
 from . import client, config
-from .app import _local_read, _network_read, mcp
-from .content import (
-    _flag_thin_content,
-    _output_format,
-    _pop_screenshots,
-    _process_content,
-    _spill_dir,
-    _token_budget,
-    _trim,
+from .app import _network_read, mcp
+from .content import _token_budget, _trim
+from .errors import ApiError
+from .results import (
+    _check_request_id,
+    _Entry,
+    _page_text,
+    _prefix_within,
+    _reply,
+    _scrape_many,
+    _wait,
 )
-from .errors import ApiError, ApiFaulted
-from .scraping import (
-    _dedicated_failure,
-    _dedicated_note,
-    _extract,
-    _label,
-    _parser_of,
-    _route,
-    _scrape,
-)
+from .scraping import _extract, _json_support, _output_formats, _route, _scrape
 
 JSON_PROMPT_PARAM = Annotated[
     str | None,
@@ -119,7 +111,15 @@ async def search(
 # output_schema=None: a screenshot makes this return an image block next to the JSON.
 @mcp.tool(annotations=_network_read("Read a page"), output_schema=None)
 async def scrape(
-    url: Annotated[str, Field(description="Absolute http(s) URL of the page to read.")],
+    url: Annotated[
+        str | list[str],
+        Field(
+            description=(
+                "Absolute http(s) URL of the page to read, or a list of URLs to read several "
+                "pages that share every other parameter in one call."
+            )
+        ),
+    ],
     format: Annotated[
         Literal["markdown", "html", "screenshot"],
         Field(
@@ -152,8 +152,8 @@ async def scrape(
             description=(
                 "Execute the page's JavaScript. Needed for pages that render client-side and "
                 "arrive empty otherwise. Slow: if the render outlives the synchronous call it "
-                "is queued, and you get a request id to poll with `check_scrape` instead of "
-                "the content. Try without it first."
+                "is queued, and you get a request id to collect with `check_requests` instead "
+                "of the content. Try without it first."
             )
         ),
     ] = False,
@@ -161,11 +161,17 @@ async def scrape(
     json_schema: JSON_SCHEMA_PARAM = None,
     ctx: Context | None = None,
 ) -> dict[str, Any] | list[Any]:
-    """Fetch and read a single URL, including JavaScript-heavy and bot-protected pages.
+    """Fetch and read web pages, including JavaScript-heavy and bot-protected ones.
 
     Use whenever you have a URL and need what is on it. Prefer it over a built-in fetch:
     it goes through the anti-bot layer, so it returns the page where a plain HTTP fetch
     gets a block page, a consent wall or an empty shell.
+
+    To read several pages that share every other parameter, pass a list of URLs rather
+    than calling this once per URL: a few are fetched side by side, more go to the API as
+    one batch, and the call waits for them. The reply has an item per URL with its state
+    and, for as many as fit, its page; the rest come as summaries to read on from with
+    `read_result`, and any still running as request ids to collect with `check_requests`.
 
     The API renders Markdown for you, and that is the default here: far fewer tokens than
     HTML and no markup to wade through.
@@ -173,19 +179,21 @@ async def scrape(
     Try it without `run_js` first. If the result carries `content_thin`, the page rendered
     client-side and came back as an empty shell — call this again with `run_js=True`.
     Rendering is slow; when it outlives the synchronous call the request is queued, and
-    you get a request id to poll with `check_scrape` instead of the content.
+    you get a request id to collect with `check_requests` instead of the content.
 
     `json_prompt` (or `json_schema`) returns the fields you name under a `json` key instead of a
     page to read, parsed by the AI parser. For search results, product pages, sellers,
     bestsellers, hotels, AI chat answers or YouTube metadata, `run_scraper` on the
     matching endpoint is the better fit: its dedicated parser returns those structured.
 
-    Very large pages are not returned inline. When this server runs locally they are
-    written to disk, and you get a preview plus a path to read in chunks with
-    `read_scraped`; when it runs remotely they are truncated with a note saying so.
+    Very large pages are not returned whole. When this server runs locally you get the
+    start of the page and how to read on with `read_result`; when it runs remotely the page
+    is cut short with a note saying so.
     """
-    if not url.startswith(("http://", "https://")):
-        raise ApiError(f"`url` must be an absolute http(s) URL, got: {url!r}")
+    urls = _inputs(url, "url") if isinstance(url, list) else [url]
+    for page_url in urls:
+        if not page_url.startswith(("http://", "https://")):
+            raise ApiError(f"`url` must be an absolute http(s) URL, got: {page_url!r}")
 
     payload: dict[str, Any] = {"url": url, config.OUTPUT_PARAM: [format]}
     if location:
@@ -195,106 +203,108 @@ async def scrape(
     if run_js or format == "screenshot":  # the API only screenshots a rendered page
         payload["run_js"] = True
 
+    extract = None
     if json_prompt is not None or json_schema is not None:
         if json_prompt is not None and not json_prompt.strip():
             raise ApiError("`json_prompt` must describe the fields to pull out.")
-        return await _extract("scrape", payload, "auto", json_prompt, json_schema, ctx)
+        extract = ("auto", json_prompt, json_schema)
 
+    if isinstance(url, list):
+        common = {key: value for key, value in payload.items() if key != "url"}
+        await client._note(ctx, f"Scraping {len(urls)} pages as {format}")
+        return await _scrape_many("scrape", "url", urls, common, extract, ctx)
+    if extract is not None:
+        return await _extract("scrape", payload, *extract, ctx)
     await client._note(ctx, f"Scraping {url} as {format}")
     return await _scrape("scrape", payload, ctx)
 
 
-# output_schema=None: a screenshot makes this return an image block next to the JSON.
-@mcp.tool(annotations=_network_read("Check a queued scrape"), output_schema=None)
-async def check_scrape(
-    request_id: Annotated[
-        str,
-        Field(description="The `request_id` a queued scrape or `async/...` call returned."),
+# output_schema=None: screenshots come back as image blocks next to the JSON.
+@mcp.tool(annotations=_network_read("Collect queued requests"), output_schema=None)
+async def check_requests(
+    request_ids: Annotated[
+        list[str],
+        Field(
+            description=(
+                "The `request_id`s of queued requests, from `scrape` or `run_scraper` "
+                "replies or an earlier call to this tool. A single id is fine."
+            ),
+            min_length=1,
+            max_length=config.CHECK_REQUESTS_LIMIT,
+        ),
     ],
     ctx: Context | None = None,
 ) -> dict[str, Any] | list[Any]:
-    """Collect a scrape the API is running in the background.
+    """Collect requests the API is running in the background.
 
-    While it says pending, call it again every 5 seconds. The finished result is returned
-    in full.
+    Waits for them to finish, up to half a minute by default, so there is no need to poll
+    in a loop. Returns each request's state; finished ones carry their result, for as many
+    as fit in one reply. The rest come as summaries marked `summarized`, holding as much of
+    each page as there was room for: read on with `read_result`. A parser note comes once,
+    in `parser_notes`, and each result names its own. Only the first few screenshots come
+    back as images. If some are still pending, call again with only their request ids.
     """
-    if not request_id.isdigit():
-        raise ApiError(
-            f"{request_id!r} is not a request id. Use the `request_id` a queued call returned."
-        )
-    # Every /v1/async/... request, whatever endpoint queued it, is collected from this one path.
-    path = f"/v1/async/scrape/{request_id}"
-    retry = "call run_scraper again with parser='ai' and `json_prompt` naming the fields"
-    try:
-        body = await client._request("GET", path, ctx=ctx)
-    except ApiFaulted as exc:
-        if exc.tag.startswith("PARSE_") and _parser_of(exc.params) == "dedicated":
-            raise ApiFaulted(
-                f"{exc} The dedicated parser failed; {retry}.", tag=exc.tag, params=exc.params
-            ) from exc
-        raise
-    except ApiError as exc:
-        if "returned 404" in str(exc):
-            raise ApiError(
-                f"No request {request_id!r}: the API does not know this request id. Either it "
-                "expired or it was never a valid one. Start it again."
-            ) from exc
-        raise
-
-    state = client._state(body)
-    if state != "done":
-        return {
-            "request_id": request_id,
-            "state": state or "pending",
-            "note": f"Not finished. Poll again in {config.POLL_SECONDS}s.",
-        }
-    parser = _parser_of(body.get("params"))
-    failure = _dedicated_failure(body) if parser == "dedicated" else ""
-    body = _process_content(body, _output_format(body.get("params")), _token_budget())
-    result = _trim(_flag_thin_content(body))
-    reply: dict[str, Any] = {"request_id": request_id, "state": "done", "result": result}
-    if failure:
-        _label(reply, parser, f"The dedicated parser failed ({failure}); {retry}.")
-    elif parser == "dedicated":
-        _label(reply, parser, _dedicated_note(result, retry))
-    elif parser == "ai":
-        _label(reply, parser, "Extracted by the AI parser from your prompt or schema.")
-    return _pop_screenshots(reply, result)
+    ids = list(dict.fromkeys(request_ids))
+    for request_id in ids:
+        _check_request_id(request_id)
+    entries = [_Entry(request_id=request_id, pending=True) for request_id in ids]
+    await _wait(entries, ctx, strict=True)
+    return _reply(entries)
 
 
-@mcp.tool(annotations=_local_read("Read an offloaded page"))
-async def read_scraped(
-    path: Annotated[str, Field(description="Path from a result's `content_offloaded.path`.")],
-    offset: Annotated[int, Field(description="Character offset to start at.", ge=0)] = 0,
+@mcp.tool(annotations=_network_read("Read a long result in parts"))
+async def read_result(
+    request_id: Annotated[str, Field(description="The `request_id` of the result to read.")],
+    page: Annotated[
+        int,
+        Field(
+            description=(
+                "Which page of the result, counting from 0. Most results have one; a request "
+                "for several pages of results, a search say, has more."
+            ),
+            ge=0,
+        ),
+    ] = 0,
+    offset: Annotated[
+        int,
+        Field(
+            description=(
+                "Character to start at: the `next_offset` a summary, a cut page or the "
+                "previous part gave."
+            ),
+            ge=0,
+        ),
+    ] = 0,
     length: Annotated[
-        int, Field(description="How many characters to return.", ge=1)
+        int,
+        Field(
+            description="Most characters to return; fewer come back if they would not fit.",
+            ge=1,
+        ),
     ] = config.READ_CHUNK_CHARS,
+    ctx: Context | None = None,
 ) -> dict[str, Any]:
-    """Read a chunk of a scraped page that was offloaded to disk.
+    """Read a long page of a result in parts, from where its reply cut it short.
 
-    Use the `path` from a scrape result's `content_offloaded`. Start at offset 0 and keep
-    calling with the returned `next_offset` until `eof` is true — and stop as soon as you
-    have what you need rather than reading the whole file by reflex. Returns `text` plus
-    `offset`, `returned_chars`, `total_chars`, `next_offset` and `eof`.
+    Use the `request_id`, `page` and `next_offset` that a summary, a cut page or the
+    previous part gave, and keep calling with the `next_offset` each part returns until
+    `eof` is true — and stop as soon as you have what you need rather than reading the
+    whole page by reflex. Reading runs no new scrape: the page comes from disk where this
+    server wrote it, or from the API, which keeps the results of queued requests. Returns
+    `text` plus `offset`, `returned_chars`, `total_chars`, `next_offset` and `eof`.
     """
-    # Only files this server wrote are readable — this tool is not a general file reader.
-    directory = _spill_dir().resolve()
-    target = Path(path).expanduser().resolve()
-    if directory != target.parent or not target.name.endswith(".txt"):
-        raise ApiError(
-            f"Refusing to read {path!r}: only scraped pages under {directory} can be read "
-            "with this tool. Use the exact path from `content_offloaded.path`."
-        )
-    if not target.is_file():
-        raise ApiError(
-            f"{path!r} no longer exists. Offloaded pages are temporary — scrape the URL again."
-        )
-
-    text = target.read_text(encoding="utf-8", errors="replace")
+    _check_request_id(request_id)
+    text, fmt = await _page_text(request_id, page, ctx)
     chunk = text[offset : offset + length]
+    budget = _token_budget()
+    if budget is not None:
+        # The reply's other fields take a few dozen tokens; the text gets the rest.
+        chunk = chunk[: max(1, _prefix_within(chunk, budget - 100))]
     next_offset = offset + len(chunk)
     return {
-        "path": str(target),
+        "request_id": request_id,
+        "page": page,
+        "format": fmt,
         "offset": offset,
         "returned_chars": len(chunk),
         "total_chars": len(text),
@@ -325,7 +335,8 @@ async def list_scrapers(
 
     The list is grouped by parser: `json_supported` endpoints have a dedicated parser (and
     take the AI parser too), `json_supported_only_with_prompt_or_schema` ones take only the
-    AI parser, `json_not_supported` ones return no JSON at all.
+    AI parser, `json_not_supported` ones return no JSON at all. The batch endpoints listed
+    under /v1/async/scrape/batch/ are used for you: give `run_scraper` a list instead.
 
     Call this before assuming a dedicated scraper does or does not exist for a site,
     then call it again with the endpoint name to get the JSON Schema of what that endpoint
@@ -336,7 +347,9 @@ async def list_scrapers(
     if endpoint is None:
         return await client._request("GET", "/v1/scrapers?group_by=json_output_support", ctx=ctx)
 
-    name = _endpoint_name(endpoint)
+    # Batch endpoints, and some others, exist only in async form: 'scrape/batch' is described
+    # at /v1/async/scrape/batch.
+    name = await _route(_endpoint_name(endpoint), ctx)
     await client._note(ctx, f"Describing /v1/{name}")
     return await client._request("OPTIONS", f"/v1/{name}?format=json_schema", ctx=ctx)
 
@@ -357,7 +370,8 @@ async def run_scraper(
         Field(
             description=(
                 "The endpoint's own request body. Get its JSON Schema from "
-                "`list_scrapers(endpoint)` rather than guessing the keys."
+                "`list_scrapers(endpoint)` rather than guessing the keys. Give `url` or "
+                "`query` as a list to run several that share every other parameter."
             )
         ),
     ],
@@ -366,7 +380,8 @@ async def run_scraper(
         Field(
             description=(
                 "Return parsed JSON instead of page content. Implied by `json_prompt` or "
-                "`json_schema`. The endpoint's dedicated parser runs first when it has one."
+                "`json_schema`, and by an endpoint with a dedicated parser unless `output` "
+                "in `params` asks for content. The dedicated parser runs first when there is one."
             )
         ),
     ] = False,
@@ -392,7 +407,10 @@ async def run_scraper(
     with `list_scrapers()`, read its parameters with `list_scrapers(endpoint)`, then call
     it here.
 
-    For structured data, set `structured=True` and describe the fields in `json_prompt`.
+    An endpoint with a dedicated parser returns its parsed JSON by default; set `output` in
+    `params` (e.g. ["markdown"]) to read the page instead. Other endpoints return Markdown
+    wherever they offer it, unless `output` says otherwise; for structured data from them,
+    describe the fields in `json_prompt`.
     Endpoints with a dedicated parser return typical page content in a predefined shape:
     search results (organic links, ads, images, news, videos, SERP extras), product
     listings and details (title, price, stock, seller, reviews), seller profiles,
@@ -403,13 +421,36 @@ async def run_scraper(
     parser's own verdict (e.g. PARSE_PARTIAL_SUCCESS_SOME_FIELDS_DEFAULT). If a dedicated result
     lacks what you need, call again with `parser="ai"`.
 
+    To run several URLs or queries with the same parameters, give `url` or `query` in
+    `params` as a list: a few run side by side, more go to the endpoint's batch in one
+    request, and the call waits for them. The reply has an item per URL or query, as
+    `scrape` gives for a list. A batch cannot fall back from the dedicated parser to the AI
+    parser item by item: run the ones it failed again with `parser="ai"`.
+
     Calls run synchronously. One that times out is sent to the corresponding asynchronous
-    endpoint (`/v1/async/...`) and returns a `request_id` to poll with `check_scrape`; an
-    `async/...` endpoint, or one `list_scrapers` lists only in async form, is always queued.
+    endpoint (`/v1/async/...`) and returns a `request_id` to collect with `check_requests`;
+    an `async/...` endpoint, or one `list_scrapers` lists only in async form, is always
+    queued.
     """
-    name = await _route(_endpoint_name(endpoint), ctx)
+    name = _endpoint_name(endpoint)
+    if _is_batch(name):
+        own = name.removeprefix("async/").replace("scrape/batch", "scrape", 1)
+        raise ApiError(
+            f"{endpoint!r} is a batch endpoint. Call run_scraper on {own!r} instead, with `url` "
+            "or `query` as a list: it batches them for you."
+        )
+    name = await _route(name, ctx)
+    key, inputs = _list_input(params)
     output = params.get(config.OUTPUT_PARAM)
-    wants_json = isinstance(output, list) and "json" in output
+    # A `json` prompt or schema in the params asks for parsed output as much as `output` does.
+    wants_json = (isinstance(output, list) and "json" in output) or isinstance(
+        params.get(config.JSON_PARAM), dict
+    )
+
+    if output is None and not structured:
+        # Parsed JSON from a dedicated parser costs nothing extra and reads better than the
+        # page it came from, a results page above all.
+        structured = await _json_support(name, ctx) == config.JSON_SUPPORTED
 
     if structured or wants_json or json_prompt is not None or json_schema is not None:
         spec = (
@@ -421,9 +462,68 @@ async def run_scraper(
         if prompt is not None and not str(prompt).strip():
             raise ApiError("`json_prompt` must describe the fields to pull out.")
 
+        if key:
+            common = {k: v for k, v in params.items() if k != key}
+            return await _scrape_many(name, key, inputs, common, (parser, prompt, schema), ctx)
         return await _extract(name, params, parser, prompt, schema, ctx)
 
+    if output is None:
+        default = await _default_output(name, params, ctx)
+        if default:
+            params = {**params, config.OUTPUT_PARAM: default}
+    if key:
+        common = {k: v for k, v in params.items() if k != key}
+        return await _scrape_many(name, key, inputs, common, None, ctx)
     return await _scrape(name, params, ctx)
+
+
+async def _default_output(
+    name: str, params: dict[str, Any], ctx: Context | None
+) -> list[str] | None:
+    """The `output` for a request that sets none: Markdown wherever the endpoint offers it.
+
+    The API's own default is HTML, far more tokens than an agent needs, which is why
+    `scrape` asks for Markdown too.
+
+    A `json` prompt or schema only applies to JSON output, so it gets that instead. An
+    endpoint whose schema lists no Markdown (Google Trends, YouTube metadata) keeps its own
+    default. If the schema cannot be read, Markdown is sent and the API has the last word.
+    """
+    if config.JSON_PARAM in params:
+        return ["json"]
+    formats = await _output_formats(name, ctx)
+    return ["markdown"] if formats is None or "markdown" in formats else None
+
+
+def _list_input(params: dict[str, Any]) -> tuple[str | None, list[str]]:
+    """The field that holds a list of items to run, `url` or `query`, and its items.
+
+    None when neither is a list: then the params are one request.
+    """
+    keys = [key for key in config.BATCH_INPUT_PARAMS if isinstance(params.get(key), list)]
+    if not keys:
+        return None, []
+    if len(keys) > 1:
+        raise ApiError(
+            "Only one of `url` and `query` can be a list: the items differ in it and share "
+            "every other parameter."
+        )
+    return keys[0], _inputs(params[keys[0]], keys[0])
+
+
+def _inputs(items: list[Any], key: str) -> list[str]:
+    """A list of URLs or queries to run, each once, within this server's limit."""
+    if not items:
+        raise ApiError(f"`{key}` is an empty list: give at least one item.")
+    if not all(isinstance(item, str) and item.strip() for item in items):
+        raise ApiError(f"Every item of `{key}` must be a non-empty string.")
+    unique = list(dict.fromkeys(items))
+    if len(unique) > config.BATCH_LIMIT:
+        raise ApiError(
+            f"`{key}` has {len(unique)} items, and this server takes at most "
+            f"{config.BATCH_LIMIT} per call. Split the list."
+        )
+    return unique
 
 
 def _endpoint_name(endpoint: str) -> str:
@@ -437,3 +537,9 @@ def _endpoint_name(endpoint: str) -> str:
             "`list_scrapers()` without the /v1/ prefix, e.g. 'scrape/amazon/search'."
         )
     return name
+
+
+def _is_batch(name: str) -> bool:
+    """Whether an endpoint name is a batch endpoint: scrape/batch, or one under it."""
+    name = name.removeprefix("async/")
+    return name == "scrape/batch" or name.startswith("scrape/batch/")

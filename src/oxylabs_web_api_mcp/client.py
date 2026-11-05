@@ -179,24 +179,42 @@ def _state(body: dict[str, Any]) -> Any:
     return body.get("state")
 
 
-def _check_rate_limit() -> None:
+def _check_rate_limit(cost: int = 1) -> None:
     """Stop a runaway agent from spending the whole key. Off unless the operator sets it.
 
-    The count lives in this process, so each replica keeps its own.
+    `cost` is how many scrapes the call starts: a batch is one call but many scrapes, and
+    each of them counts. The count lives in this process, so each replica keeps its own.
     """
     if config.RATE_LIMIT is None:
         return
     count, window = config.RATE_LIMIT
-    cutoff = time.time() - window
-    _CALL_TIMES[:] = [t for t in _CALL_TIMES if t > cutoff]
-    if len(_CALL_TIMES) >= count:
-        wait = int(_CALL_TIMES[0] + window - time.time()) + 1
+    limit = os.environ.get("OXYLABS_RATE_LIMIT")
+    advice = (
+        "Do not retry in a loop — do something else, or ask the operator to raise "
+        "OXYLABS_RATE_LIMIT."
+    )
+    if cost > count:
+        if cost == 1:  # a limit of 0
+            raise ApiError(f"This server's own rate limit ({limit}) allows no scrapes. {advice}")
         raise ApiError(
-            f"This server's own rate limit ({os.environ.get('OXYLABS_RATE_LIMIT')}) is "
-            f"exhausted. It frees up in about {wait}s. Do not retry in a loop — do "
-            "something else, or ask the operator to raise OXYLABS_RATE_LIMIT."
+            f"A batch of {cost} is more than this server's own rate limit ({limit}) allows "
+            f"in a whole window. Send at most {count} at a time. {advice}"
         )
-    _CALL_TIMES.append(time.time())
+    now = time.time()
+    _CALL_TIMES[:] = [t for t in _CALL_TIMES if t > now - window]
+    room = count - len(_CALL_TIMES)
+    if cost > room:
+        # The oldest calls leave the window first; this many of them must go to make room.
+        wait = int(_CALL_TIMES[cost - room - 1] + window - now) + 1
+        if cost == 1:
+            problem = f"is exhausted. It frees up in about {wait}s."
+        else:
+            problem = (
+                f"has room for {room} more scrapes, and this batch is {cost}. Send at most "
+                f"{room}, or wait about {wait}s for room for all of them."
+            )
+        raise ApiError(f"This server's own rate limit ({limit}) {problem} {advice}")
+    _CALL_TIMES.extend([now] * cost)
 
 
 async def _request(
@@ -207,15 +225,28 @@ async def _request(
     ctx: Context | None = None,
     api_key: str | None = None,
     retry_faulted: bool = True,
+    idempotent: bool = True,
+    cost: int = 1,
 ) -> dict[str, Any]:
     """Call the Web API, turning transport failures into agent-readable errors.
 
     Transient upstream failures (500, 502, 503, 504) and connection errors are retried
     here with exponential backoff. The agent has no better move than trying again, so
     doing it in the server saves a round trip and a confused recovery.
+
+    A POST that must not run twice (`idempotent=False`: anything it queues, a batch above
+    all) is resent only when the API cannot have taken it — a refused connection, a 429 or
+    a 503 — and any other failure says it may have been queued anyway. `cost` is how many
+    scrapes a POST starts.
     """
     if method == "POST":
-        _check_rate_limit()
+        _check_rate_limit(cost)
+    retry_status = config.RETRY_STATUS if idempotent else config.QUEUE_RETRY_STATUS
+    maybe_taken = (
+        ""
+        if idempotent
+        else " It may have been queued anyway, so sending it again could run it twice."
+    )
     headers = {
         "Authorization": f"Bearer {api_key or _api_key()}",
         "x-oxylabs-sdk": _sdk_header(ctx),
@@ -235,8 +266,11 @@ async def _request(
                     method, f"{config.BASE_URL}{path}", json=payload, headers=headers
                 )
         except httpx.TimeoutException as exc:
-            raise ApiError(f"Request to {path} timed out.") from exc
+            unsent = isinstance(exc, (httpx.ConnectTimeout, httpx.PoolTimeout))
+            raise ApiError(f"Request to {path} timed out.{'' if unsent else maybe_taken}") from exc
         except httpx.HTTPError as exc:
+            if not idempotent and not isinstance(exc, httpx.ConnectError):
+                raise ApiError(f"Request to {path} failed: {exc}.{maybe_taken}") from exc
             last_error = ApiError(
                 f"Could not reach the Oxylabs Web API at {config.BASE_URL}{path}: {exc}"
             )
@@ -248,13 +282,15 @@ async def _request(
         faulted = body is not None and _state(body) == "faulted"
         settled = _timed_out(body) or (faulted and (method == "GET" or not retry_faulted))
         if (
-            resp.status_code in config.RETRY_STATUS
+            resp.status_code in retry_status
             and attempt < config.RETRIES
             and not _quota_spent(resp)
             and not settled
         ):
             last_error = ApiError(f"{path} returned {resp.status_code}: {_detail(resp)}")
             continue
+        if maybe_taken and resp.status_code in config.RETRY_STATUS - retry_status and not settled:
+            raise ApiError(f"{path} returned {resp.status_code}: {_detail(resp)}.{maybe_taken}")
         return _check(resp, path)
 
     raise last_error or ApiError(f"{path} failed after {config.RETRIES + 1} attempts.")
@@ -266,5 +302,15 @@ async def _note(ctx: Context | None, message: str) -> None:
         return
     try:
         await ctx.info(message)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _progress(ctx: Context | None, progress: int, total: int, message: str) -> None:
+    """Report how far a long call has got, so the client knows it is alive. Never fatal."""
+    if ctx is None:
+        return
+    try:
+        await ctx.report_progress(progress, total, message)
     except Exception:  # noqa: BLE001
         pass

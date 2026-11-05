@@ -27,7 +27,7 @@ def test_a_sync_timeout_is_sent_to_the_async_endpoint():
     assert [path for path, _ in api.posts] == ["/v1/scrape", "/v1/async/scrape"], api.posts
     assert api.posts[0][1] == api.posts[1][1], "the queued request must be the same payload"
     assert out["state"] == "pending" and out["request_id"] == "7500000000000000001"
-    assert "check_scrape('7500000000000000001')" in out["note"]
+    assert "check_requests(['7500000000000000001'])" in out["note"]
     assert "timed out" in out["note"], out["note"]
     assert "params" not in out and "metadata" not in out
 
@@ -59,7 +59,44 @@ def test_run_scraper_runs_sync_even_with_run_js_and_queues_async_endpoints():
     with _api(_pending) as api:
         out = asyncio.run(run_scraper("async/scrape/chatgpt", {"prompt": "hi"}))
     assert api.posts[0][0] == "/v1/async/scrape/chatgpt"
-    assert "check_scrape('7500000000000000001')" in out["note"]
+    assert "check_requests(['7500000000000000001'])" in out["note"]
+
+
+def test_run_scraper_defaults_to_markdown_where_the_endpoint_offers_it():
+    only_json = {"properties": {"output": {"type": "array", "items": {"enum": ["json"]}}}}
+    trends = "/v1/scrape/google/trends/explore"
+    timeout = ApiTimeout("/v1/scrape/amazon/search returned 500: took too long")
+    answers = (
+        lambda p: _done(p, markdown="word " * 200),
+        lambda p: _done(p, markdown="word " * 200),
+        lambda p: _done(p, json={"x": 1}),
+        lambda p: _done(p, html="<p>x</p>"),
+        timeout,
+        _pending,
+    )
+    with _api(*answers, schemas={trends: only_json}) as api:
+        for _ in range(2):
+            asyncio.run(run_scraper("scrape/amazon/search", {"query": "x"}))
+        asyncio.run(run_scraper("scrape/google/trends/explore", {"query": "x"}))
+        asyncio.run(run_scraper("scrape/amazon/search", {"query": "x", "output": ["html"]}))
+        asyncio.run(run_scraper("scrape/amazon/search", {"query": "y"}))
+    outputs = [payload.get("output") for _, payload in api.posts]
+    # HTML is the API's default; Markdown is what an agent can read, as with `scrape`.
+    assert outputs[:2] == [["markdown"], ["markdown"]]
+    # Trends only answers in JSON, so it keeps its own default instead of being refused.
+    assert outputs[2] is None
+    # An `output` the caller set is sent as is.
+    assert outputs[3] == ["html"]
+    # A timed-out call is queued with the same payload, Markdown included.
+    assert api.posts[4:] == [
+        ("/v1/scrape/amazon/search", {"query": "y", "output": ["markdown"]}),
+        ("/v1/async/scrape/amazon/search", {"query": "y", "output": ["markdown"]}),
+    ]
+    # Each endpoint's schema is read once, not once per call.
+    assert [path for method, path, _ in api.calls if method == "OPTIONS"] == [
+        "/v1/scrape/amazon/search?format=json_schema",
+        f"{trends}?format=json_schema",
+    ]
 
 
 def test_extract_on_a_url_uses_the_ai_parser_without_asking():
@@ -145,7 +182,7 @@ def test_a_queued_dedicated_parse_says_how_to_fall_back():
         )
     assert api.posts[0][0] == "/v1/async/scrape/chatgpt" and "json" not in api.posts[0][1]
     assert out["parser"] == "dedicated" and "request_id" in out
-    assert "check_scrape" in out["parser_note"], out["parser_note"]
+    assert "check_requests" in out["parser_note"], out["parser_note"]
 
 
 def test_a_queued_ai_parse_is_not_called_extracted():
@@ -340,3 +377,73 @@ def test_a_target_scrape_without_output_budgets_the_format_the_api_picked():
     result = out["results"][0]
     assert "content_truncated" in result, result.keys()
     assert len(result["html"]) < size
+
+
+def test_run_scraper_sends_batch_endpoints_to_the_endpoint_itself():
+    # A list on the endpoint itself is batched within the size cap, each item charged against
+    # the rate limit; a batch endpoint called directly would be neither.
+    for endpoint, own in (
+        ("scrape/batch", "'scrape'"),
+        ("async/scrape/batch", "'scrape'"),
+        ("/v1/async/scrape/batch/amazon/product", "'scrape/amazon/product'"),
+    ):
+        with _api() as api:
+            try:
+                asyncio.run(run_scraper(endpoint, {"url": ["https://a.com", "https://b.com"]}))
+            except ApiError as exc:
+                assert f"run_scraper on {own}" in str(exc) and "as a list" in str(exc), exc
+            else:
+                raise AssertionError(f"{endpoint!r} must be refused")
+        assert api.calls == [], api.calls
+
+
+def test_a_queued_post_is_not_resent_when_the_api_may_have_taken_it(monkeypatch):
+    """The API queues a job before it writes the reply: a failed reply may follow a job."""
+
+    def api(*statuses):
+        calls = []
+
+        def respond(method, url):
+            status = statuses[min(len(calls), len(statuses) - 1)]
+            calls.append(status)
+            body = {"state": "pending", "metadata": {"request_id": "7500000000000000009"}}
+            return httpx.Response(status, json=body, request=httpx.Request(method, url))
+
+        monkeypatch.setattr(httpx, "AsyncClient", _stub_client(respond))
+        return calls
+
+    def queue():
+        return asyncio.run(scraping._queue("async/scrape", {"url": "https://ex.com"}, None))
+
+    monkeypatch.setattr(config, "RETRY_BASE_DELAY", 0)
+    for status in (500, 502, 504):
+        calls = api(status, 202)
+        try:
+            queue()
+        except ApiError as exc:
+            assert "may have been queued" in str(exc), exc
+        else:
+            raise AssertionError(f"a {status} must not be resent")
+        assert calls == [status], calls
+    # A 429 or a 503 comes before anything is queued, so it is resent.
+    for status in (429, 503):
+        calls = api(status, 202)
+        assert queue()["request_id"] == "7500000000000000009"
+        assert calls == [status, 202], calls
+
+
+def test_run_scraper_returns_the_dedicated_parse_by_default():
+    with _api(
+        _parsed("PARSE_SUCCESS", {"title": "x"}), lambda p: _done(p, markdown="x" * 600)
+    ) as api:
+        out = asyncio.run(run_scraper("scrape/amazon/product", {"query": "B0X"}))
+        # An `output` set by the caller still gets the page.
+        asyncio.run(run_scraper("scrape/amazon/product", {"query": "B0X", "output": ["markdown"]}))
+    first, second = (payload for _, payload in api.posts)
+    assert first == {"query": "B0X", "output": ["json"]} and out["parser"] == "dedicated"
+    assert second == {"query": "B0X", "output": ["markdown"]}
+
+    # Without a dedicated parser it stays Markdown.
+    with _api(lambda p: _done(p, markdown="x" * 600)) as api:
+        asyncio.run(run_scraper("scrape/amazon/search", {"query": "shoes"}))
+    assert api.posts[0][1]["output"] == ["markdown"]

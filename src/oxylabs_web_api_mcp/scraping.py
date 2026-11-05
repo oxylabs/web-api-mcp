@@ -20,6 +20,7 @@ from .content import (
 from .errors import ApiError, ApiFaulted, ApiTimeout
 
 _JSON_GROUPS: dict[str, tuple[float, dict[str, str]]] = {}
+_OUTPUT_FORMATS: dict[tuple[str, str], tuple[float, frozenset[str]]] = {}
 
 
 def _async_path(name: str) -> str:
@@ -37,25 +38,27 @@ async def _queue(
     """
     path = f"/v1/{_async_path(name)}"
     await client._note(ctx, f"Queueing {path}")
-    response = _trim(await client._request("POST", path, payload, ctx=ctx))
+    response = _trim(await client._request("POST", path, payload, ctx=ctx, idempotent=False))
     request_id = response.get("request_id")
     if not request_id:
         raise ApiError(f"{path} accepted the request but returned no request_id: {response}")
     response["note"] = (
-        f"{reason or 'Queued. '}Call check_scrape('{request_id}') every {config.POLL_SECONDS}s "
-        "while it says pending."
+        f"{reason or 'Queued. '}Collect it with check_requests(['{request_id}']), which "
+        "waits for it to finish."
     )
     return response
 
 
 async def _scrape(
-    name: str, payload: dict[str, Any], ctx: Context | None
+    name: str, payload: dict[str, Any], ctx: Context | None, raw: bool = False
 ) -> dict[str, Any] | list[Any]:
     """Run a scrape synchronously, and queue it only if the synchronous call times out.
 
     Most pages, rendered ones included, finish inside a tool call, so the sync endpoint is
     always tried first. A timeout is not resent to it: the same payload goes to the
     corresponding asynchronous endpoint and the agent gets a request id to poll instead.
+    `raw` returns the response as the API sent it, for a caller fitting several into one
+    reply.
     """
     if name.startswith("async/"):
         return await _queue(name, payload, ctx)
@@ -75,6 +78,8 @@ async def _scrape(
             ),
         )
 
+    if raw:
+        return response
     echoed = response.get("params")
     fmt = _output_format(
         echoed if isinstance(echoed, dict) and echoed.get(config.OUTPUT_PARAM) else payload
@@ -110,6 +115,32 @@ async def _scraper_groups(ctx: Context | None) -> dict[str, str] | None:
         }
         cached = (time.time() + config.JSON_GROUPS_TTL_SECONDS, by_path)
         _JSON_GROUPS[key] = cached
+    return cached[1]
+
+
+async def _output_formats(name: str, ctx: Context | None) -> frozenset[str] | None:
+    """The `output` values an endpoint accepts, from its JSON Schema; None if unknown.
+
+    Cached per key and endpoint for as long as the parser groups. An endpoint whose
+    schema has no `output` field accepts none.
+    """
+    key = (hashlib.sha256(client._api_key().encode()).hexdigest(), name)
+    cached = _OUTPUT_FORMATS.get(key)
+    if cached is None or cached[0] < time.time():
+        try:
+            schema = await client._request("OPTIONS", f"/v1/{name}?format=json_schema", ctx=ctx)
+        except ApiError:
+            return None
+        properties = schema.get("properties") if isinstance(schema, dict) else None
+        if not isinstance(properties, dict):
+            return None
+        output = properties.get(config.OUTPUT_PARAM)
+        items = output.get("items") if isinstance(output, dict) else None
+        enum = items.get("enum") if isinstance(items, dict) else None
+        if output is not None and not isinstance(enum, list):
+            return None
+        cached = (time.time() + config.JSON_GROUPS_TTL_SECONDS, frozenset(map(str, enum or ())))
+        _OUTPUT_FORMATS[key] = cached
     return cached[1]
 
 
@@ -188,6 +219,7 @@ async def _extract(
     prompt: str | None,
     schema: dict[str, Any] | None,
     ctx: Context | None,
+    raw: bool = False,
 ) -> dict[str, Any] | list[Any]:
     """Return structured JSON, from the endpoint's dedicated parser when it has one.
 
@@ -195,6 +227,7 @@ async def _extract(
     the AI parser returns what the prompt or schema describes. So the dedicated one goes
     first, and the AI parser runs when there is none, when it failed or came back empty,
     or when the caller asks for it after a dedicated result lacked what they needed.
+    `raw` is passed on to `_scrape`.
     """
     group = await _json_support(name, ctx)
     if group == config.JSON_NOT_SUPPORTED:
@@ -217,7 +250,7 @@ async def _extract(
     if dedicated and parser == "auto":
         await client._note(ctx, f"Parsing /v1/{name} with its dedicated parser")
         try:
-            response = await _scrape(name, base, ctx)
+            response = await _scrape(name, base, ctx, raw)
         except ApiFaulted as exc:
             # A failed parse can fault the whole request; a failed scrape would fail the AI
             # parser too, so only the former is worth a second attempt.
@@ -234,7 +267,7 @@ async def _extract(
                 return _label(
                     response,
                     "dedicated",
-                    "Queued with the endpoint's dedicated parser. check_scrape reports its "
+                    "Queued with the endpoint's dedicated parser. check_requests reports its "
                     f"verdict; if it failed or lacks the fields you need, {retry}.",
                 )
             failure = _dedicated_failure(response)
@@ -253,10 +286,12 @@ async def _extract(
             "(or `json_schema`) describing the fields to pull out."
         )
     await client._note(ctx, f"Parsing /v1/{name} with the AI parser")
-    response = await _scrape(name, {**base, config.JSON_PARAM: ai_spec}, ctx)
+    response = await _scrape(name, {**base, config.JSON_PARAM: ai_spec}, ctx, raw)
     if _is_queued(response):
         return _label(
-            response, "ai", "Queued with the AI parser. check_scrape returns the extracted fields."
+            response,
+            "ai",
+            "Queued with the AI parser. check_requests returns the extracted fields.",
         )
     return _label(response, "ai", "Extracted by the AI parser from your prompt or schema.")
 

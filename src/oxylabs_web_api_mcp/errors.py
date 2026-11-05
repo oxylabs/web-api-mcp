@@ -19,6 +19,10 @@ class ApiTimeout(ApiError):
     """The API did not answer in time."""
 
 
+class ApiNotFound(ApiError):
+    """The API does not know a request id: it expired, or it never was one."""
+
+
 class ApiFaulted(ApiError):
     """The request ran and failed. `tag` names why, e.g. `PARSE_FAILED`; `params` echoes it."""
 
