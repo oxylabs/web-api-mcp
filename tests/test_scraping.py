@@ -447,3 +447,26 @@ def test_run_scraper_returns_the_dedicated_parse_by_default():
     with _api(lambda p: _done(p, markdown="x" * 600)) as api:
         asyncio.run(run_scraper("scrape/amazon/search", {"query": "shoes"}))
     assert api.posts[0][1]["output"] == ["markdown"]
+
+
+def test_a_json_prompt_and_a_json_schema_are_not_sent_together():
+    # The API's AI parser takes one or the other, and refuses a request carrying both.
+    prompt, schema = "the title", {"type": "object", "properties": {"title": {"type": "string"}}}
+    for call in (
+        lambda: scrape("https://ex.com", json_prompt=prompt, json_schema=schema),
+        lambda: scrape(["https://a.com", "https://b.com"], json_prompt=prompt, json_schema=schema),
+        lambda: run_scraper(
+            "scrape", {"url": "https://ex.com", "json": {"prompt": prompt, "schema": schema}}
+        ),
+        lambda: run_scraper(
+            "scrape", {"url": "https://ex.com", "json": {"schema": schema}}, json_prompt=prompt
+        ),
+    ):
+        with _api() as api:
+            try:
+                asyncio.run(call())
+            except ApiError as exc:
+                assert "cannot be used together" in str(exc), exc
+            else:
+                raise AssertionError("a prompt and a schema together must be refused")
+        assert api.posts == [], api.posts

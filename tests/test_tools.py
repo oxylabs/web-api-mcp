@@ -864,3 +864,18 @@ def test_read_result_explains_what_it_cannot_read(monkeypatch):
             assert "has 1 page(s)" in str(exc), exc
         else:
             raise AssertionError("a page past the end must be refused")
+
+
+def test_a_list_scrapes_every_item_it_is_given_even_a_repeated_one():
+    """Five times the same URL is five scrapes, run side by side; six go to a batch."""
+    url = "https://delfi.lt"
+    page = lambda p: _done(p, markdown="news " * 200)  # noqa: E731
+    with _api(*[page] * 5) as api:
+        out = asyncio.run(scrape([url] * 5))
+    assert api.posts == [("/v1/scrape", {"url": url, "output": ["markdown"]})] * 5
+    assert out["done"] == 5 and [item["input"] for item in out["items"]] == [url] * 5
+
+    with _api(_batch_reply("url", [url] * 6)) as api:
+        out = asyncio.run(scrape([url] * 6))
+    assert api.posts == [("/v1/async/scrape/batch", {"url": [url] * 6, "output": ["markdown"]})]
+    assert len(out["items"]) == 6

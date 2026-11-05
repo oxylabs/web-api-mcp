@@ -28,8 +28,8 @@ JSON_PROMPT_PARAM = Annotated[
         description=(
             "Fields to pull out as JSON, in plain words: name them and say what shape you "
             "want. Used by the AI parser, which runs when the endpoint has no dedicated "
-            "parser or its dedicated parser did not return them. Leave unset to read the "
-            "content yourself."
+            "parser or its dedicated parser did not return them. Pass this or `json_schema`, "
+            "not both. Leave unset to read the content yourself."
         ),
         examples=["Parse the product title, price, and a list of image links"],
     ),
@@ -38,8 +38,8 @@ JSON_SCHEMA_PARAM = Annotated[
     dict[str, Any] | None,
     Field(
         description=(
-            "A JSON Schema the AI parser's output must follow, instead of or alongside "
-            "`json_prompt`. Use it when you need the exact same shape off many pages."
+            "A JSON Schema the AI parser's output must follow, instead of `json_prompt`: the "
+            "two cannot be combined. Use it when you need the exact same shape off many pages."
         ),
     ),
 ]
@@ -205,8 +205,7 @@ async def scrape(
 
     extract = None
     if json_prompt is not None or json_schema is not None:
-        if json_prompt is not None and not json_prompt.strip():
-            raise ApiError("`json_prompt` must describe the fields to pull out.")
+        _check_json_spec(json_prompt, json_schema)
         extract = ("auto", json_prompt, json_schema)
 
     if isinstance(url, list):
@@ -458,9 +457,7 @@ async def run_scraper(
         )
         prompt = json_prompt if json_prompt is not None else spec.get("prompt")
         schema = json_schema if json_schema is not None else spec.get("schema")
-
-        if prompt is not None and not str(prompt).strip():
-            raise ApiError("`json_prompt` must describe the fields to pull out.")
+        _check_json_spec(prompt, schema)
 
         if key:
             common = {k: v for k, v in params.items() if k != key}
@@ -495,6 +492,17 @@ async def _default_output(
     return ["markdown"] if formats is None or "markdown" in formats else None
 
 
+def _check_json_spec(prompt: Any, schema: Any) -> None:
+    """Refuse what the API refuses: a blank prompt, or a prompt and a schema together."""
+    if prompt is not None and not str(prompt).strip():
+        raise ApiError("`json_prompt` must describe the fields to pull out.")
+    if prompt and schema:
+        raise ApiError(
+            "`json_prompt` and `json_schema` cannot be used together: the AI parser takes one of "
+            "them. Pass `json_schema` when you need an exact shape, `json_prompt` otherwise."
+        )
+
+
 def _list_input(params: dict[str, Any]) -> tuple[str | None, list[str]]:
     """The field that holds a list of items to run, `url` or `query`, and its items.
 
@@ -512,18 +520,18 @@ def _list_input(params: dict[str, Any]) -> tuple[str | None, list[str]]:
 
 
 def _inputs(items: list[Any], key: str) -> list[str]:
-    """A list of URLs or queries to run, each once, within this server's limit."""
+    """A list of URLs or queries to run, as given — a repeated one runs again — within this
+    server's limit."""
     if not items:
         raise ApiError(f"`{key}` is an empty list: give at least one item.")
     if not all(isinstance(item, str) and item.strip() for item in items):
         raise ApiError(f"Every item of `{key}` must be a non-empty string.")
-    unique = list(dict.fromkeys(items))
-    if len(unique) > config.BATCH_LIMIT:
+    if len(items) > config.BATCH_LIMIT:
         raise ApiError(
-            f"`{key}` has {len(unique)} items, and this server takes at most "
+            f"`{key}` has {len(items)} items, and this server takes at most "
             f"{config.BATCH_LIMIT} per call. Split the list."
         )
-    return unique
+    return list(items)
 
 
 def _endpoint_name(endpoint: str) -> str:
