@@ -9,13 +9,12 @@ from pydantic import Field
 
 from . import client, config
 from .app import _network_read, mcp
-from .content import _token_budget, _trim
+from .content import _prefix_within, _token_budget, _trim
 from .errors import ApiError
 from .results import (
     _check_request_id,
     _Entry,
     _page_text,
-    _prefix_within,
     _reply,
     _scrape_many,
     _wait,
@@ -104,7 +103,7 @@ async def search(
     if location:
         payload["location"] = location
 
-    await client._note(ctx, f"Searching: {query!r}" + (f" ({location})" if location else ""))
+    client._note(f"Searching: {query!r}" + (f" ({location})" if location else ""))
     return _trim(await client._request("POST", "/v1/search", payload, ctx=ctx))
 
 
@@ -190,6 +189,7 @@ async def scrape(
     start of the page and how to read on with `read_result`; when it runs remotely the page
     is cut short with a note saying so.
     """
+    client._start_progress()
     urls = _inputs(url, "url") if isinstance(url, list) else [url]
     for page_url in urls:
         if not page_url.startswith(("http://", "https://")):
@@ -210,11 +210,11 @@ async def scrape(
 
     if isinstance(url, list):
         common = {key: value for key, value in payload.items() if key != "url"}
-        await client._note(ctx, f"Scraping {len(urls)} pages as {format}")
+        client._note(f"Scraping {len(urls)} pages as {format}")
         return await _scrape_many("scrape", "url", urls, common, extract, ctx)
     if extract is not None:
         return await _extract("scrape", payload, *extract, ctx)
-    await client._note(ctx, f"Scraping {url} as {format}")
+    client._note(f"Scraping {url} as {format}")
     return await _scrape("scrape", payload, ctx)
 
 
@@ -243,6 +243,7 @@ async def check_requests(
     in `parser_notes`, and each result names its own. Only the first few screenshots come
     back as images. If some are still pending, call again with only their request ids.
     """
+    client._start_progress()
     ids = list(dict.fromkeys(request_ids))
     for request_id in ids:
         _check_request_id(request_id)
@@ -349,7 +350,7 @@ async def list_scrapers(
     # Batch endpoints, and some others, exist only in async form: 'scrape/batch' is described
     # at /v1/async/scrape/batch.
     name = await _route(_endpoint_name(endpoint), ctx)
-    await client._note(ctx, f"Describing /v1/{name}")
+    client._note(f"Describing /v1/{name}")
     return await client._request("OPTIONS", f"/v1/{name}?format=json_schema", ctx=ctx)
 
 
@@ -431,6 +432,7 @@ async def run_scraper(
     an `async/...` endpoint, or one `list_scrapers` lists only in async form, is always
     queued.
     """
+    client._start_progress()
     name = _endpoint_name(endpoint)
     if _is_batch(name):
         own = name.removeprefix("async/").replace("scrape/batch", "scrape", 1)

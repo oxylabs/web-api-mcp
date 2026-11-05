@@ -270,8 +270,8 @@ integrating the API into an application.
 
 Returns `results[]` with `title`, `outline` (list of snippet strings), `url`, `metadata.position`, plus
 `related_searches[]` (`query`) and `related_questions[]` (`question`, plus nullable
-`title` and `snippet`), and `metadata.request_id`. All three arrays are always present,
-possibly empty. A `200` carries `state: "done"`. When the search fails, the call
+`title` and `snippet`), and `metadata.request_id`. `results` is always present, possibly
+empty; `related_searches` and `related_questions` are left out when empty. A `200` carries `state: "done"`. When the search fails, the call
 is a `500` with `state: "faulted"` — not charged, so retrying costs nothing.
 
 **`outline` is search snippets, not page content.** Never answer a factual question
@@ -283,7 +283,7 @@ from `outline` alone — the strings are truncated and often stale. Scrape the s
 |---|---|---|
 | `url` | string, **required** | Absolute `http(s)` URL. |
 | `output` | array | `["markdown"]`, `["html"]`, `["json"]`, `["screenshot"]`, or a combination. |
-| `json` | object | `{"prompt": "fields to extract"}` and/or `{"schema": {…}}` — with `output: ["json"]`, runs the AI parser; the result lands under the result's `json` key. Leave `json` out and send `output: ["json"]` alone to run the endpoint's dedicated parser, where it has one. |
+| `json` | object | `{"prompt": "fields to extract"}` or `{"schema": {…}}` — one of the two, never both (a `400`). With `output: ["json"]`, runs the AI parser; the result lands under the result's `json` key. Leave `json` out and send `output: ["json"]` alone to run the endpoint's dedicated parser, where it has one. |
 | `location` | string | ISO 3166-1 alpha-2 country code in uppercase, e.g. `"DE"`; `"de"` is a `400`. |
 | `device` | string | `"desktop"` or `"mobile"`. |
 | `run_js` | boolean | Execute page JavaScript. |
@@ -360,7 +360,7 @@ contract above.
 | 400 | Validation failed | Each bad field is named in `errors[].pointer` and `errors[].detail`. Fix that field. Do not retry unchanged. |
 | 401 | Bad or missing key | Stop and tell the user. Retrying will not help. |
 | 404 | Unknown endpoint, or a request id that expired or never existed | Check the endpoint against `GET /v1/scrapers`; for a request id, start the request again. |
-| 429 | Rate limit **or** spent quota | `title: "QUOTA_EXCEEDED"` means the plan's quota is spent: stop and tell the user. Otherwise it is a rate limit, already retried with jittered backoff; if you still see it, slow down. |
+| 429 | Rate limit **or** spent quota | Already retried with jittered backoff. If you still see it, slow down; if it persists, the plan's quota may be spent: stop and tell the user to check the Oxylabs dashboard. |
 | 5xx | Transient trouble, or a faulted request | Retry with jittered backoff — the MCP tools already do. A `500` with `state: "faulted"` is not charged, so retrying costs nothing; if it keeps failing, report it with the request id. |
 
 A 400 is a bug in your request. Fix the field the response names instead of retrying.

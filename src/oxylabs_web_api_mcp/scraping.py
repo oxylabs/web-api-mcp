@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import hashlib
 import time
+from collections.abc import MutableMapping
 from typing import Any
 
 from fastmcp import Context
@@ -17,10 +17,30 @@ from .content import (
     _token_budget,
     _trim,
 )
-from .errors import ApiError, ApiFaulted, ApiTimeout
+from .errors import ApiAuthError, ApiError, ApiFaulted, ApiTimeout
 
+# Per API key (hashed): the parser groups, and each endpoint's `output` values. Bounded, so
+# a server shared by many keys does not grow with every one of them.
 _JSON_GROUPS: dict[str, tuple[float, dict[str, str]]] = {}
 _OUTPUT_FORMATS: dict[tuple[str, str], tuple[float, frozenset[str]]] = {}
+
+
+def _cached(cache: MutableMapping[Any, Any], key: Any) -> Any:
+    """A live cache entry's value, or None; a hit moves to the back of the eviction line."""
+    entry = cache.pop(key, None)
+    if entry is None or entry[0] < time.time():
+        return None
+    cache[key] = entry
+    return entry[1]
+
+
+def _cache(cache: MutableMapping[Any, Any], key: Any, value: Any, limit: int) -> None:
+    """Keep `value` for `JSON_GROUPS_TTL_SECONDS`, dropping the least recently used beyond
+    `limit` entries."""
+    cache.pop(key, None)
+    cache[key] = (time.time() + config.JSON_GROUPS_TTL_SECONDS, value)
+    while len(cache) > limit:
+        del cache[next(iter(cache))]
 
 
 def _async_path(name: str) -> str:
@@ -37,7 +57,7 @@ async def _queue(
     the request lives in this process: a restart or a second replica changes nothing.
     """
     path = f"/v1/{_async_path(name)}"
-    await client._note(ctx, f"Queueing {path}")
+    client._note(f"Queueing {path}")
     response = _trim(await client._request("POST", path, payload, ctx=ctx, idempotent=False))
     request_id = response.get("request_id")
     if not request_id:
@@ -55,20 +75,27 @@ async def _scrape(
     """Run a scrape synchronously, and queue it only if the synchronous call times out.
 
     Most pages, rendered ones included, finish inside a tool call, so the sync endpoint is
-    always tried first. A timeout is not resent to it: the same payload goes to the
-    corresponding asynchronous endpoint and the agent gets a request id to poll instead.
-    `raw` returns the response as the API sent it, for a caller fitting several into one
-    reply.
+    always tried first. A timeout — the API's own, a gateway's 504, or no answer at all —
+    is not resent to it: the same payload goes to the corresponding asynchronous endpoint
+    and the agent gets a request id to poll instead. While the call runs, the client hears
+    every few seconds that it is still alive. `raw` returns the response as the API sent
+    it, for a caller fitting several into one reply, which keeps the client informed itself.
     """
     if name.startswith("async/"):
         return await _queue(name, payload, ctx)
 
     path = f"/v1/{name}"
-    await client._note(ctx, f"Running {path}")
+    client._note(f"Running {path}")
+    request = client._request(
+        "POST", path, payload, ctx=ctx, retry_faulted=False, slow_is_timeout=True
+    )
     try:
-        response = await client._request("POST", path, payload, ctx=ctx, retry_faulted=False)
+        if raw:
+            response = await request
+        else:
+            response = await client._heartbeat(ctx, request, f"Waiting for {path}")
     except ApiTimeout as exc:
-        await client._note(ctx, f"{path} timed out; queueing it instead")
+        client._note(f"{path} timed out; queueing it instead")
         return await _queue(
             name,
             payload,
@@ -93,29 +120,29 @@ async def _scraper_groups(ctx: Context | None) -> dict[str, str] | None:
 
     Read from `GET /v1/scrapers?group_by=json_output_support` and cached per key, since
     the list can differ between keys. A failed lookup is not fatal: the scrape itself
-    still answers with the authoritative error.
+    still answers with the authoritative error. A refused key is, since the scrape would
+    only fail the same way.
     """
-    key = hashlib.sha256(client._api_key().encode()).hexdigest()
-    cached = _JSON_GROUPS.get(key)
-    if cached is None or cached[0] < time.time():
+    key = client._key_id()
+    groups = _cached(_JSON_GROUPS, key)
+    if groups is None:
         try:
             body = await client._request(
                 "GET", "/v1/scrapers?group_by=json_output_support", ctx=ctx
             )
-        except ApiError as exc:
-            if "Authentication failed" in str(exc) or "Quota" in str(exc):
-                raise
+        except ApiAuthError:
+            raise
+        except ApiError:
             return None
-        groups = body.get("scrapers") if isinstance(body, dict) else None
-        by_path = {
+        listed = body.get("scrapers") if isinstance(body, dict) else None
+        groups = {
             path: group
-            for group, paths in (groups.items() if isinstance(groups, dict) else ())
+            for group, paths in (listed.items() if isinstance(listed, dict) else ())
             if isinstance(paths, list)
             for path in paths
         }
-        cached = (time.time() + config.JSON_GROUPS_TTL_SECONDS, by_path)
-        _JSON_GROUPS[key] = cached
-    return cached[1]
+        _cache(_JSON_GROUPS, key, groups, config.MAX_CACHED_KEYS)
+    return groups
 
 
 async def _output_formats(name: str, ctx: Context | None) -> frozenset[str] | None:
@@ -124,9 +151,9 @@ async def _output_formats(name: str, ctx: Context | None) -> frozenset[str] | No
     Cached per key and endpoint for as long as the parser groups. An endpoint whose
     schema has no `output` field accepts none.
     """
-    key = (hashlib.sha256(client._api_key().encode()).hexdigest(), name)
-    cached = _OUTPUT_FORMATS.get(key)
-    if cached is None or cached[0] < time.time():
+    key = (client._key_id(), name)
+    formats = _cached(_OUTPUT_FORMATS, key)
+    if formats is None:
         try:
             schema = await client._request("OPTIONS", f"/v1/{name}?format=json_schema", ctx=ctx)
         except ApiError:
@@ -139,9 +166,9 @@ async def _output_formats(name: str, ctx: Context | None) -> frozenset[str] | No
         enum = items.get("enum") if isinstance(items, dict) else None
         if output is not None and not isinstance(enum, list):
             return None
-        cached = (time.time() + config.JSON_GROUPS_TTL_SECONDS, frozenset(map(str, enum or ())))
-        _OUTPUT_FORMATS[key] = cached
-    return cached[1]
+        formats = frozenset(map(str, enum or ()))
+        _cache(_OUTPUT_FORMATS, key, formats, config.MAX_CACHED_SCHEMAS)
+    return formats
 
 
 async def _json_support(name: str, ctx: Context | None) -> str | None:
@@ -160,15 +187,30 @@ async def _route(name: str, ctx: Context | None) -> str:
     return name
 
 
+def _json_output(output: Any) -> list[str]:
+    """The `output` of a request for JSON: the caller's own list when it already asks for
+    JSON — Markdown beside the parse, say — and JSON alone otherwise."""
+    if isinstance(output, list) and config.JSON_PARAM in output:
+        return list(dict.fromkeys(output))
+    return [config.JSON_PARAM]
+
+
 def _results(response: Any) -> list[dict[str, Any]]:
     results = response.get("results") if isinstance(response, dict) else None
     return [result for result in results or [] if isinstance(result, dict)]
 
 
 def _has_json(response: Any) -> bool:
-    """Whether any result carries a non-empty parsed `json`."""
+    """Whether any result carries a non-empty parsed `json`, whole or cut to fit the reply."""
     return any(
-        result.get(config.JSON_PARAM) not in (None, {}, [], "") for result in _results(response)
+        result.get(config.JSON_PARAM) not in (None, {}, [], "")
+        or any(
+            isinstance(result.get(note), dict)
+            and result[note].get("format") == config.JSON_PARAM
+            and result[note].get("total_chars")
+            for note in ("content_offloaded", "content_truncated", "json_truncated")
+        )
+        for result in _results(response)
     )
 
 
@@ -227,7 +269,8 @@ async def _extract(
     the AI parser returns what the prompt or schema describes. So the dedicated one goes
     first, and the AI parser runs when there is none, when it failed or came back empty,
     or when the caller asks for it after a dedicated result lacked what they needed.
-    `raw` is passed on to `_scrape`.
+    An `output` that already asks for JSON beside other formats keeps them. `raw` is
+    passed on to `_scrape`.
     """
     group = await _json_support(name, ctx)
     if group == config.JSON_NOT_SUPPORTED:
@@ -237,7 +280,7 @@ async def _extract(
         )
 
     base = {k: v for k, v in payload.items() if k != config.JSON_PARAM}
-    base[config.OUTPUT_PARAM] = ["json"]
+    base[config.OUTPUT_PARAM] = _json_output(payload.get(config.OUTPUT_PARAM))
     ai_spec: dict[str, Any] = {}
     if prompt:
         ai_spec["prompt"] = prompt
@@ -248,7 +291,7 @@ async def _extract(
     # so it is sent anyway and the API answers whether the endpoint has one.
     dedicated = group == config.JSON_SUPPORTED or (group is None and not ai_spec)
     if dedicated and parser == "auto":
-        await client._note(ctx, f"Parsing /v1/{name} with its dedicated parser")
+        client._note(f"Parsing /v1/{name} with its dedicated parser")
         try:
             response = await _scrape(name, base, ctx, raw)
         except ApiFaulted as exc:
@@ -273,7 +316,7 @@ async def _extract(
             failure = _dedicated_failure(response)
             if not failure or not ai_spec:
                 return _label(response, "dedicated", _dedicated_note(response, retry))
-        await client._note(ctx, f"The dedicated parser failed ({failure}); using the AI parser")
+        client._note(f"The dedicated parser did not succeed ({failure}); using the AI parser")
 
     if not ai_spec:
         if parser == "ai":
@@ -285,7 +328,7 @@ async def _extract(
             f"/v1/{name} has no dedicated parser, so structured output needs `json_prompt` "
             "(or `json_schema`) describing the fields to pull out."
         )
-    await client._note(ctx, f"Parsing /v1/{name} with the AI parser")
+    client._note(f"Parsing /v1/{name} with the AI parser")
     response = await _scrape(name, {**base, config.JSON_PARAM: ai_spec}, ctx, raw)
     if _is_queued(response):
         return _label(

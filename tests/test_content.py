@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import os
+import stat
+import time
+from pathlib import Path
 
 from helpers import _headers
 
 from oxylabs_web_api_mcp import config, content
+from oxylabs_web_api_mcp.errors import ApiError
 from oxylabs_web_api_mcp.tools import read_result
 
 
@@ -203,3 +209,171 @@ def test_spill_files_are_named_by_request_id_and_page():
     assert len(hashed) == 16 and int(hashed, 16) >= 0
     for odd in ("", "../../etc/passwd", "12a", "١٢٣"):
         assert content._spill_stem(url, odd) == hashed, odd
+
+
+def _result(*pages, output="markdown", request_id="7504857924934611969"):
+    """One request's response holding several pages, as a search over a few pages returns."""
+    return {
+        "state": "done",
+        "params": {"output": [output]},
+        "metadata": {"request_id": request_id},
+        "results": [
+            {output: page, "metadata": {"url": f"https://ex.com/{n}"}}
+            for n, page in enumerate(pages)
+        ],
+    }
+
+
+def _reply_tokens(payload) -> int:
+    return content._estimate_tokens(json.dumps(content._trim(payload), ensure_ascii=False))
+
+
+def test_the_pages_of_one_result_share_one_budget(monkeypatch):
+    """Three pages that each fit the budget alone do not all fit one reply."""
+    monkeypatch.setattr(config, "SPILL_ENABLED", False)
+    page = "word " * 7600  # ~9.5k tokens
+    out = content._process_content(_result(page, page, page), "markdown", 10000)
+    assert _reply_tokens(out) <= 10000
+    first, *rest = out["results"]
+    assert first["markdown"] == page and "content_truncated" not in first
+    assert all(result["content_truncated"]["total_chars"] == len(page) for result in rest)
+
+
+def test_each_cut_page_of_a_result_can_be_read_on_locally(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "SPILL_ENABLED", True)
+    monkeypatch.setenv("OXYLABS_SPILL_DIR", str(tmp_path))
+    page = "word " * 7600
+    out = content._process_content(_result(page, page, page), "markdown", 10000)
+    assert _reply_tokens(out) <= 10000
+    for index, result in enumerate(out["results"][1:], start=1):
+        assert f"page={index}" in result["content_offloaded"]["note"], result
+        assert (tmp_path / f"7504857924934611969-{index}.md.txt").read_text() == page
+
+
+def test_a_large_parsed_result_is_held_to_the_budget(monkeypatch, tmp_path):
+    parsed = {
+        "reviews": [{"title": f"Review {n}", "content": "Great product. " * 40} for n in range(400)]
+    }
+    monkeypatch.setattr(config, "SPILL_ENABLED", False)
+    out = content._process_content(_result(parsed, output="json"), "json", 10000)
+    assert _reply_tokens(out) <= 10000
+    (result,) = out["results"]
+    assert result["content_truncated"]["format"] == "json"
+    assert result["json"].startswith('{"reviews"')
+
+    # Locally the whole parse goes to disk, where read_result walks it.
+    monkeypatch.setattr(config, "SPILL_ENABLED", True)
+    monkeypatch.setenv("OXYLABS_SPILL_DIR", str(tmp_path))
+    out = content._process_content(_result(parsed, output="json"), "json", 10000)
+    info = out["results"][0]["content_offloaded"]
+    assert info["path"].endswith("7504857924934611969-0.json.txt")
+    assert json.loads(Path(info["path"]).read_text()) == parsed
+
+
+def test_every_format_of_a_result_counts(monkeypatch):
+    monkeypatch.setattr(config, "SPILL_ENABLED", False)
+    payload = {
+        "params": {"output": ["markdown", "html"]},
+        "results": [{"markdown": "word " * 7000, "html": "<p>" + "word " * 7000 + "</p>"}],
+    }
+    out = content._process_content(payload, "markdown", 10000)
+    assert _reply_tokens(out) <= 10000
+    (result,) = out["results"]
+    assert result["markdown"] == "word " * 7000
+    assert result["content_truncated"]["format"] == "html"
+
+
+def test_pruning_deletes_only_this_servers_old_files(tmp_path):
+    stale = time.time() - config.SPILL_TTL_SECONDS - 60
+    kept = {
+        "notes.txt": True,  # not a name this server writes
+        "photo.png": True,
+        "7-0.md.txt": False,  # this server's, and stale
+        "0123456789abcdef.png": False,
+        "7-1.json.txt": True,  # this server's, but fresh
+    }
+    for name in kept:
+        (tmp_path / name).write_text("x")
+        if name != "7-1.json.txt":
+            os.utime(tmp_path / name, (stale, stale))
+    content._prune_spills(tmp_path)
+    assert {path.name for path in tmp_path.iterdir()} == {n for n, keep in kept.items() if keep}
+
+
+def test_the_default_spill_dir_is_private_to_its_user(monkeypatch, tmp_path):
+    if not hasattr(os, "getuid"):
+        return  # Windows keeps a temp dir per user already
+    monkeypatch.setattr(content.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setenv("OXYLABS_SPILL_DIR", "")
+    path = content._spill_dir()
+    assert path == tmp_path / f"oxylabs-web-api-mcp-{os.getuid()}"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o700
+    # One an older version left readable to others is closed up.
+    path.chmod(0o755)
+    content._spill_dir()
+    assert stat.S_IMODE(path.stat().st_mode) == 0o700
+    # A link planted where the directory belongs is refused, not followed.
+    path.rmdir()
+    (tmp_path / "elsewhere").mkdir()
+    path.symlink_to(tmp_path / "elsewhere")
+    try:
+        content._spill_dir()
+    except ApiError as exc:
+        assert "not a directory of this user's own" in str(exc), exc
+    else:
+        raise AssertionError("a symlinked spill directory must be refused")
+
+
+def test_a_spill_never_writes_through_a_link(monkeypatch, tmp_path):
+    monkeypatch.setenv("OXYLABS_SPILL_DIR", str(tmp_path))
+    victim = tmp_path / "victim.txt"
+    victim.write_text("precious")
+    (tmp_path / "7-0.md.txt").symlink_to(victim)
+    try:
+        content._spill("page", "https://ex.com", "markdown", "7", 0)
+    except ApiError:
+        pass
+    else:
+        raise AssertionError("a write must not follow a link")
+    assert victim.read_text() == "precious"
+
+
+def _png(width: int, height: int, padding: int = 5) -> str:
+    header = (
+        (13).to_bytes(4, "big") + b"IHDR" + width.to_bytes(4, "big") + height.to_bytes(4, "big")
+    )
+    return base64.b64encode(b"\x89PNG\r\n\x1a\n" + header + b"\0" * padding).decode()
+
+
+def test_a_screenshot_too_big_for_a_model_is_not_sent_as_an_image(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "SPILL_ENABLED", False)
+    tall = {"results": [{"screenshot": _png(1280, 20000)}]}
+    assert content._decode_screenshots(tall) == []
+    info = tall["results"][0]["screenshot"]
+    assert (info["width"], info["height"]) == (1280, 20000)
+    assert "Not returned as an image" in info["note"] and "markdown" in info["note"], info
+
+    # Locally the file is still there to open.
+    monkeypatch.setattr(config, "SPILL_ENABLED", True)
+    monkeypatch.setenv("OXYLABS_SPILL_DIR", str(tmp_path))
+    monkeypatch.setattr(config, "MAX_SCREENSHOT_BYTES", 100)
+    heavy = {"results": [{"screenshot": _png(1280, 900, padding=200)}]}
+    assert content._decode_screenshots(heavy, "7") == []
+    info = heavy["results"][0]["screenshot"]
+    assert Path(info["path"]).exists() and "Open the file at `path`" in info["note"], info
+
+    # One that fits goes out as an image, its size noted.
+    monkeypatch.setattr(config, "MAX_SCREENSHOT_BYTES", 3_750_000)
+    fits = {"results": [{"screenshot": _png(1280, 4000)}]}
+    ((info, _),) = content._decode_screenshots(fits, "8")
+    assert info["note"] == "Returned as an image block." and info["height"] == 4000
+
+
+def test_an_error_page_is_not_sent_to_run_js():
+    page = _page("# Not Found")
+    page["results"][0]["metadata"]["statuses"] = {
+        "http_request": {"code": 404, "tag": "HTTP_NOT_FOUND"}
+    }
+    thin = content._flag_thin_content(page)["results"][0]["content_thin"]
+    assert "HTTP 404" in thin["note"] and "run_js will not help" in thin["note"], thin
+    assert "run_js=True" not in thin["note"]

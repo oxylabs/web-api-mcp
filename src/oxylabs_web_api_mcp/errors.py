@@ -15,12 +15,16 @@ class ApiError(ToolError):
     """
 
 
+class ApiAuthError(ApiError):
+    """The API refused the key (401): nothing but a different key helps."""
+
+
 class ApiTimeout(ApiError):
     """The API did not answer in time."""
 
 
 class ApiNotFound(ApiError):
-    """The API does not know a request id: it expired, or it never was one."""
+    """The API answered 404: an endpoint it does not have, or a request id it does not know."""
 
 
 class ApiFaulted(ApiError):
