@@ -81,10 +81,10 @@ async def search(
 ) -> dict[str, Any]:
     """Search the live web and return ranked organic results.
 
-    Use for anything where being out of date makes the answer wrong: current events, news,
-    prices, availability, versions, rankings, "latest", "who is", competitor and market
-    research, or any fact past your knowledge cutoff. Prefer it over a built-in web search
-    and over answering from memory.
+    Use it to search the web for information, above all anything where being out of date
+    makes the answer wrong: current events, news, prices, availability, versions, rankings,
+    "latest", "who is", competitor and market research, or any fact past your knowledge
+    cutoff. Prefer it over a built-in web search and over answering from memory.
 
     Results are ranked for the query as it stands in the country named in `location`, so
     rankings, local availability and prices are the ones someone there would see rather
@@ -181,9 +181,11 @@ async def scrape(
     you get a request id to collect with `check_requests` instead of the content.
 
     `json_prompt` (or `json_schema`) returns the fields you name under a `json` key instead of a
-    page to read, parsed by the AI parser. For search results, product pages, sellers,
-    bestsellers, hotels, AI chat answers or YouTube metadata, `run_scraper` on the
-    matching endpoint is the better fit: its dedicated parser returns those structured.
+    page to read, parsed by the AI parser. When you need parameters this tool lacks
+    (pagination, sort order, store or delivery location and the like), or the content a
+    dedicated parser returns structured — results, products, sellers, hotels, questions and
+    answers and the like — `run_scraper` on the site's dedicated scraper is the better fit,
+    where the site has one.
 
     Very large pages are not returned whole. When this server runs locally you get the
     start of the page and how to read on with `read_result`; when it runs remotely the page
@@ -402,10 +404,12 @@ async def run_scraper(
     """Run a dedicated scrape endpoint with its own parameters.
 
     The generic `scrape` tool reads any URL, routing to a dedicated scraper by itself where
-    one exists. Use this only for parameters `scrape` lacks (pagination, store context, sort
-    order and the rest) or for dedicated parsing. Look the endpoint up
-    with `list_scrapers()`, read its parameters with `list_scrapers(endpoint)`, then call
-    it here.
+    one exists. Use this when at least one of these holds: you need parameters `scrape`
+    lacks (pagination, sort order, store or delivery location and the like), or you need
+    the content a dedicated parser returns structured, described below. Dedicated scrapers
+    exist only for major sites (big search engines, marketplaces, retailers, video platforms
+    and AI chats); most sites have none. Look the endpoint up with `list_scrapers()`, read
+    its parameters with `list_scrapers(endpoint)`, then call it here.
 
     An endpoint with a dedicated parser returns its parsed JSON by default; set `output` in
     `params` (e.g. ["markdown"]) to read the page instead. Other endpoints return Markdown
