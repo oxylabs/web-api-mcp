@@ -34,12 +34,12 @@ more, or both:
 
 | Need | Call | When |
 |---|---|---|
-| Find pages on a topic | `search` | No URL yet. One question per search |
+| Search the web for information | `search` | No URL yet. One question per search |
 | Read a page you have a URL for | `scrape` | The default, for any site. Markdown, one fetch |
 | Read a page that came back empty or with indication that it requires javascript rendering | `scrape` + `run_js=True` | Only after a plain scrape returned `content_thin` |
 | Named fields off any page | `scrape(url, json_prompt=…)` | No dedicated endpoint fits, or its parser lacked the fields. The AI parser extracts what you describe |
-| A site-specific scraper | `list_scrapers` then `run_scraper` | The generic scraper does not carry the parameter you need |
-| Typical structured content: search results, products, sellers, bestsellers, hotels, AI chat answers, YouTube metadata | `run_scraper(endpoint, params, structured=True, json_prompt=…)` | A dedicated endpoint exists for it — its dedicated parser returns the content in a predefined shape |
+| Parameters `scrape` lacks | `list_scrapers` then `run_scraper` | The site has a dedicated scraper. Only major sites do |
+| Typical structured content: results, products, sellers, bestsellers, hotels, questions and answers, video metadata | `run_scraper(endpoint, params, structured=True, json_prompt=…)` | The site has a dedicated parser — `list_scrapers` lists it under `json_supported` |
 | Read several URLs (or run several queries) with the same parameters | `scrape([url, …])`, or `run_scraper` with `url` or `query` as a list | Only the URLs or queries differ; every other parameter applies to all of them. One call, which waits for the results |
 | Collect a queued request | `check_requests([request_id, …])` | A reply carried a `request_id` still pending. It waits for it; call again with only the ids still pending |
 | Read on in a page too long to return | `read_result(request_id, page, offset)` | A page carried `content_offloaded`, or a summary carried `next_offset` |
