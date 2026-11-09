@@ -1,0 +1,37 @@
+name: Sync skill
+
+# The bundled skill is a copy of web-api-skills' SKILL.md (the canonical one). Daily, copy
+# it over the bundled one and, if that changes anything, open or update a PR with the change.
+# Nothing blocks other PRs; the sync PR handles the drift on its own.
+# Relies on the repo setting that lets GitHub Actions create pull requests (enabled).
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Copy the skill from web-api-skills main
+        run: ./scripts/sync-skill.sh https://raw.githubusercontent.com/oxylabs/web-api-skills/main/skills/oxylabs-web-api/SKILL.md
+      - name: Open or update the sync PR
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: bot/sync-skill
+          delete-branch: true
+          commit-message: Sync the bundled skill from web-api-skills
+          title: Sync the bundled skill from web-api-skills
+          body: |
+            The bundled skill differs from `skills/oxylabs-web-api/SKILL.md` on
+            [web-api-skills](https://github.com/oxylabs/web-api-skills) `main`, so this PR copies it over
+            (`scripts/sync-skill.sh`). Opened by the daily `Sync skill` workflow.
+
+            If this undoes an edit made to the bundled copy here, move that edit to web-api-skills instead —
+            that is the copy the plugin and other agents install.
