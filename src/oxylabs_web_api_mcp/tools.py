@@ -5,10 +5,11 @@ from __future__ import annotations
 from typing import Annotated, Any, Literal
 
 from fastmcp import Context
-from pydantic import Field
+from pydantic import Field, StringConstraints
 
 from . import client, config
 from .app import _network_read, mcp
+from .companies import _fit_companies
 from .content import _prefix_within, _token_budget, _trim
 from .errors import ApiError
 from .results import (
@@ -105,6 +106,57 @@ async def search(
 
     client._note(f"Searching: {query!r}" + (f" ({location})" if location else ""))
     return _trim(await client._request("POST", "/v1/search", payload, ctx=ctx))
+
+
+@mcp.tool(annotations=_network_read("Company search"))
+async def search_companies(
+    query: Annotated[
+        str,
+        Field(
+            description=(
+                "A company name or a free-text description of the companies wanted. Say what "
+                "they do, where and how big, in words."
+            ),
+            examples=["electric vehicle battery makers in Germany", "Figma"],
+            max_length=2000,
+        ),
+        StringConstraints(strip_whitespace=True, min_length=1),
+    ],
+    max_results: Annotated[
+        int,
+        Field(
+            description=(
+                "Maximum number of companies to return. Profiles are long: ask for what you "
+                "will use. The response may contain fewer."
+            ),
+            ge=1,
+            le=100,
+        ),
+    ] = 10,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Search for companies and return their profiles, best match first.
+
+    Use it to look up a company by name, or to find companies matching a description
+    (an industry, a product, a place, a size): market and competitor mapping, lead lists,
+    funding research. Prefer it over `search` plus `scrape` when the answer is a company's
+    facts rather than a web page.
+
+    A profile can carry the website and LinkedIn URLs, description, industry, founding
+    year, employee count, headquarters, funding, annual revenue and web traffic; any field
+    may be missing. The figures are often estimates and not necessarily current: check
+    one that matters on the company's own website with `scrape`.
+
+    There are no location or filter parameters: describe the whole set you want in one
+    `query`.
+    """
+    client._note(f"Searching companies: {query!r}")
+    reply = _trim(
+        await client._request(
+            "POST", "/v1/search/companies", {"query": query, "max_results": max_results}, ctx=ctx
+        )
+    )
+    return _fit_companies(reply, _token_budget())
 
 
 # output_schema=None: a screenshot makes this return an image block next to the JSON.
@@ -262,7 +314,8 @@ async def read_result(
         Field(
             description=(
                 "Which page of the result, counting from 0. Most results have one; a request "
-                "for several pages of results, a search say, has more."
+                "for several pages of results, a search say, has more. A `search_companies` "
+                "list is always page 0."
             ),
             ge=0,
         ),
@@ -287,6 +340,9 @@ async def read_result(
     ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Read a long page of a result in parts, from where its reply cut it short.
+
+    Also reads a `search_companies` list that was cut to fit: that has one page, `page=0`,
+    and no other page exists for it.
 
     Use the `request_id`, `page` and `next_offset` that a summary, a cut page or the
     previous part gave, and keep calling with the `next_offset` each part returns until
