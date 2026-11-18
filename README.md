@@ -262,7 +262,7 @@ Web pages routinely exceed what is sensible to hand an agent in one response, so
 
 The threshold is `OXYLABS_MAX_INLINE_TOKENS` (default 10 000). `read_result` reads only the files this server wrote to the spill directory, found by request id — it is deliberately not a general file reader.
 
-Full API documentation: **[Oxylabs Web API docs](https://developers.oxylabs.io/products/web-api)**
+Full API documentation: **[Oxylabs Web API docs](https://dashboard.oxylabs.io/?utm_source=github&utm_medium=referral&utm_content=web-api-mcp)**
 
 ### Security notes
 
@@ -289,9 +289,9 @@ The tests are offline: error parsing, input validation, envelope trimming, endpo
 
 For detailed configuration, advanced usage, and code examples in multiple languages, check the official documentation:
 
-- [Oxylabs MCP documentation](<https://developers.oxylabs.io/ai-workflows/mcp>)
-- [Get started with Web API](https://oxylabs.io/products/web-api)
-- [Web API documentation](https://developers.oxylabs.io/products/web-api)
+- [Oxylabs MCP documentation](https://developers.oxylabs.io/ai-workflows/mcp?utm_source=github&utm_medium=referral&utm_content=web-api-mcp)
+- [Get started with Web API](https://oxylabs.io/products/web-api?utm_source=github&utm_medium=referral&utm_content=web-api-mcp)
+- [Web API documentation](https://developers.oxylabs.io/products/web-api?utm_source=github&utm_medium=referral&utm_content=web-api-mcp)
 
 ## License
 
