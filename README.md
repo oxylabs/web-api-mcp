@@ -16,13 +16,14 @@ The tools and their behavior are the same on both options, and the sections on s
 | Tool | What it does |
 |---|---|
 | `search` | Search the live web, returns ranked organic results (title, outline snippets, URL) |
+| `search_companies` | Search companies by name or free-text description, returns company profiles best match first (industry, size, headquarters, funding, revenue, web traffic) |
 | `scrape` | Read a URL, or a list of URLs, as **Markdown** by default, including JS-heavy and bot-protected pages. Ask for a screenshot, or pass `json_prompt` / `json_schema` to pull named fields off the page as JSON |
 | `list_scrapers` | List the scrape endpoints the API implements, grouped by parser support, or describe one's parameters |
 | `run_scraper` | Run a dedicated scrape endpoint with its own parameters, as content or as structured JSON; a list of `url`s or `query`s runs them all |
 | `check_requests` | Collect requests the API is running in the background, waiting for them to finish |
-| `read_result` | Read a page too long for one reply in parts, by its request id |
+| `read_result` | Read a page, or a `search_companies` list, too long for one reply in parts, by its request id |
 
-All six are annotated `readOnlyHint` — nothing here writes anything, so clients can run
+All seven are annotated `readOnlyHint` — nothing here writes anything, so clients can run
 them without prompting.
 
 ## Requirements
@@ -186,8 +187,8 @@ These variables apply to a server you run yourself. The Remote MCP server's sett
 | `OXYLABS_BASE_URL` | `https://webapi.oxylabs.io` | Override the API base URL, e.g. to go through a proxy |
 | `OXYLABS_RETRIES` | `2` | Retries on transient errors |
 | `OXYLABS_RATE_LIMIT` | *(off)* | Cap what each API key spends through this server, e.g. `100/1h`, `50/30m`. Each item of a batch counts as one scrape |
-| `OXYLABS_MAX_INLINE_TOKENS` | `10000` | Token budget for one reply; content beyond it is offloaded (stdio) or truncated (HTTP) |
-| `OXYLABS_SPILL_DIR` | a per-user directory in the system temp dir | Where offloaded pages and screenshots are written (stdio only). Must be a directory you own |
+| `OXYLABS_MAX_INLINE_TOKENS` | `10000` | Token budget for one reply; content beyond it is offloaded (stdio) or truncated (HTTP); company lists are shrunk and trimmed |
+| `OXYLABS_SPILL_DIR` | a per-user directory in the system temp dir | Where offloaded pages, company lists and screenshots are written (stdio only). Must be a directory you own |
 | `OXYLABS_SPILL` | `1` | Set to `0` to keep everything inline even on stdio |
 | `MCP_TRANSPORT` | `stdio` | `stdio` or `http` |
 | `HOST` / `PORT` | `127.0.0.1` / `8080` | HTTP transport bind address |
@@ -259,6 +260,8 @@ Web pages routinely exceed what is sensible to hand an agent in one response, so
 
 - **Running locally (stdio):** the page is written to the spill directory, named by its request id. The agent gets up to the first 2 000 characters (less when several pages share the reply) and pulls the rest through `read_result(request_id, page, offset)` — reading only as far as it needs instead of paying for the whole page up front.
 - **Running over HTTP (Remote MCP or a self-hosted HTTP server):** there is no shared filesystem. A queued result is read on in parts with the same `read_result`, straight from the API, which keeps it. A synchronous result is not kept by the API, so a page too long for one reply is cut short with a note stating its full length.
+
+`search_companies` returns profiles, not a page, so it is fitted differently. Over budget, every company is kept and cut only as far as needed: first to its key facts (name, website, LinkedIn, a 200-character description, industry, type, founding year, employees, headquarters city and country, total funding, revenue), then to its name, website and country. Only if even that does not fit are the lowest-ranked dropped, and a first item too long on its own is cut to its start. A `note` in the reply says what was cut and how to get one company in full: search again with its website domain (`oxylabs.io`) as the `query` and `max_results=1`. Running locally, the full list is also written to the spill directory, and `read_result(request_id, page=0)` reads it in parts. Over HTTP nothing is kept, so that search, a narrower `query` or a smaller `max_results` is the way to get the rest.
 
 The threshold is `OXYLABS_MAX_INLINE_TOKENS` (default 10 000). `read_result` reads only the files this server wrote to the spill directory, found by request id — it is deliberately not a general file reader.
 

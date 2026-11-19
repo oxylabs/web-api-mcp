@@ -1,7 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-10-17/server.schema.json",
   "name": "io.oxylabs/web-api-mcp",
-  "description": "Search the live web and read any page through the Oxylabs Web API.",
+  "description": "Search the live web, look up companies and read any page through the Oxylabs Web API.",
   "repository": {
     "url": "https://github.com/oxylabs/web-api-mcp",
     "source": "github"

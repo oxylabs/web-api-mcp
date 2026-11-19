@@ -8,7 +8,7 @@ import json
 
 import httpx
 from fastmcp.utilities.types import Image
-from helpers import GROUPS, _api, _done, _pending, _stub_client
+from helpers import GROUPS, _api, _done, _headers, _pending, _stub_client
 
 from oxylabs_web_api_mcp import app, client, config, results, scraping, skill, tools
 from oxylabs_web_api_mcp.content import _estimate_tokens
@@ -19,6 +19,7 @@ from oxylabs_web_api_mcp.tools import (
     read_result,
     run_scraper,
     scrape,
+    search_companies,
 )
 
 
@@ -50,6 +51,100 @@ def test_search_rejects_bad_input_before_calling_the_api():
         except Exception:  # noqa: BLE001 — ApiError or FastMCP's own validation error
             continue
         raise AssertionError(f"expected an error for {kwargs}")
+
+
+def _company(i: int, description: str = "") -> dict:
+    return {
+        "name": f"Company {i}",
+        "website_url": f"https://c{i}.example",
+        "description": description,
+    }
+
+
+_BIG_COMPANIES = [_company(i, "word " * 100) for i in range(40)]
+
+
+def test_search_companies_posts_to_its_endpoint_and_trims_the_envelope():
+    reply = {
+        "state": "done",
+        "results": [_company(1)],
+        "params": {"query": "robots", "max_results": 3},
+        "metadata": {"timestamp": 1, "request_id": "42"},
+    }
+    with _api(reply) as api:
+        out = asyncio.run(search_companies("warehouse robots", max_results=3))
+    assert api.posts == [("/v1/search/companies", {"query": "warehouse robots", "max_results": 3})]
+    assert out == {"state": "done", "results": [_company(1)], "request_id": "42"}
+
+
+def test_search_companies_strips_the_query_it_is_given_as_a_tool():
+    with _api({"state": "done", "results": [_company(1)]}) as api:
+        asyncio.run(app.mcp.call_tool("search_companies", {"query": "  warehouse robots "}))
+    assert api.posts == [("/v1/search/companies", {"query": "warehouse robots", "max_results": 10})]
+
+
+def test_search_companies_rejects_bad_input_before_calling_the_api():
+    for kwargs in ({"query": "   "}, {"query": "ok", "max_results": 101}):
+        with _api() as api:
+            try:
+                asyncio.run(app.mcp.call_tool("search_companies", kwargs))
+            except Exception:  # noqa: BLE001 — ApiError or FastMCP's own validation error
+                assert not api.calls, kwargs
+                continue
+        raise AssertionError(f"expected an error for {kwargs}")
+
+
+def test_search_companies_keeps_every_company_as_key_facts_when_the_budget_allows(monkeypatch):
+    monkeypatch.setattr(config, "MAX_INLINE_TOKENS", 3500)
+    with _api({"state": "done", "results": _BIG_COMPANIES}):
+        out = asyncio.run(search_companies("robots", max_results=40))
+    kept = out["results"]
+    assert [c["name"] for c in kept] == [c["name"] for c in _BIG_COMPANIES]
+    # The description is shortened, the name and website stay.
+    assert all(c["website_url"] and len(c["description"]) < 250 for c in kept)
+    assert _within_budget(out)
+    assert "key facts" in out["note"] and "best of" not in out["note"], out["note"]
+
+
+def test_search_companies_drops_the_lowest_ranked_to_fit_the_token_budget(monkeypatch):
+    monkeypatch.setattr(config, "MAX_INLINE_TOKENS", 500)
+    with _api({"state": "done", "results": _BIG_COMPANIES}):
+        out = asyncio.run(search_companies("robots", max_results=40))
+    kept = out["results"]
+    # Cut to name and website, and the lowest-ranked go.
+    assert 1 <= len(kept) < 40, len(kept)
+    assert kept == [
+        {"name": c["name"], "website_url": c["website_url"]} for c in _BIG_COMPANIES[: len(kept)]
+    ]
+    assert _within_budget(out)
+    assert f"{len(kept)} best of 40" in out["note"], out["note"]
+
+
+def test_search_companies_spills_the_list_when_the_api_puts_request_id_in_metadata(
+    monkeypatch, tmp_path
+):
+    # The API's own shape: the id sits under `metadata`, not at the top level.
+    monkeypatch.setattr(config, "MAX_INLINE_TOKENS", 500)
+    monkeypatch.setattr(config, "SPILL_ENABLED", True)
+    monkeypatch.setenv("OXYLABS_SPILL_DIR", str(tmp_path))
+    raw = {
+        "state": "done",
+        "results": _BIG_COMPANIES,
+        "params": {"query": "robots"},
+        "metadata": {"timestamp": 1, "request_id": "123456789"},
+    }
+    with _api(raw):
+        out = asyncio.run(search_companies("robots", max_results=40))
+
+    assert "read_result('123456789', page=0)" in out["note"], out["note"]
+    assert json.loads((tmp_path / "123456789-0.json.txt").read_text()) == _BIG_COMPANIES
+
+
+def test_search_companies_returns_a_reply_whole_when_the_budget_is_off(monkeypatch):
+    monkeypatch.setattr(config, "MAX_INLINE_TOKENS", 500)
+    with _api({"state": "done", "results": _BIG_COMPANIES}), _headers({"x-mcp-max-tokens": "0"}):
+        out = asyncio.run(search_companies("robots", max_results=40))
+    assert out["results"] == _BIG_COMPANIES and "note" not in out
 
 
 def test_scrape_rejects_relative_urls():
