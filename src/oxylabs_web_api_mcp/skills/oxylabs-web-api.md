@@ -37,7 +37,7 @@ more, or both:
 | Need | Call | When |
 |---|---|---|
 | Search the web for information | `search` | No URL yet. One question per search |
-| Look up a company, or find companies matching a description | `search_companies` | The answer is company facts — industry, size, headquarters, funding, revenue, web traffic — not a web page. One query describes the whole set, and there is no `location` parameter, so put the country or city in the query (`"fintech startups in Lithuania"`). For "who are X's competitors", describe them in the query; for how they compare on pricing or features, `search` and `scrape` the sources. If the tool is not in your tool list, use the helper script's `companies` command or `POST /v1/search/companies` |
+| Look up a company, or find companies matching a description | `search_companies` | The answer is company facts — industry, size, headquarters, funding, revenue, web traffic — not a web page. One query describes the whole set, and there is no `location` parameter, so put the country or city in the query (`"fintech startups in Lithuania"`). For "who are X's competitors", describe them in the query; for how they compare on pricing or features, `search` and `scrape` the sources. If the tool is not in your tool list, use `POST /v1/search/companies` |
 | Read a page you have a URL for | `scrape` | The default, for any site. Markdown, one fetch |
 | Read a page that came back empty or with indication that it requires javascript rendering | `scrape` + `run_js=True` | Only after a plain scrape returned `content_thin` |
 | Named fields off any page | `scrape(url, json_prompt=…)` | No dedicated endpoint fits, or its parser lacked the fields. The AI parser extracts what you describe |
@@ -390,11 +390,11 @@ python scripts/web_api.py search "best rain jacket 2026" --max-results 3 --scrap
 python scripts/web_api.py companies "electric vehicle battery makers in Germany" --max-results 5
 ```
 
-`companies` prints each profile's key facts (name, website, LinkedIn URL, a 200-character
-description, industry, type, founding year, employees, headquarters city and country, total
-funding, revenue) so a long list stays readable. Add `--full` for whole profiles — investors and
-web traffic included — and keep `--max-results` small with it. To get one company in full, search
-its website domain with `--max-results 1 --full`.
+`companies` prints each profile cut to its key facts (the basics, headquarters, funding and
+revenue; `KEY_FACTS` in the script is the list) so a long list stays readable. A `note` in the
+output says so. Add `--full` for whole profiles — investors and web traffic included — and keep
+`--max-results` small with it. To get one company in full, search its website domain with
+`--max-results 1 --full`.
 
 Scrapes default to Markdown. `--run-js` is the empty-page retry — same rules as the MCP
 path: plain scrape first, retry once, never pre-emptively.
