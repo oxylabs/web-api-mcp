@@ -1,5 +1,5 @@
 {
-  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-10-17/server.schema.json",
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.oxylabs/web-api-mcp",
   "description": "Search the live web, look up companies and read any page through the Oxylabs Web API.",
   "repository": {
@@ -7,12 +7,12 @@
     "source": "github"
   },
   "websiteUrl": "https://oxylabs.io",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "oxylabs-web-api-mcp",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "transport": { "type": "stdio" },
       "environmentVariables": [
         {
@@ -20,6 +20,28 @@
           "description": "Oxylabs Web API key, from a Web API instance in the Oxylabs dashboard.",
           "isRequired": true,
           "isSecret": true
+        }
+      ]
+    }
+  ],
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://mcp.oxylabs.io/web-api-mcp",
+      "headers": [
+        {
+          "name": "Authorization",
+          "description": "Oxylabs Web API key, from a Web API instance in the Oxylabs dashboard.",
+          "value": "Bearer {api_key}",
+          "isRequired": true,
+          "isSecret": true,
+          "variables": {
+            "api_key": {
+              "description": "Oxylabs Web API key, from a Web API instance in the Oxylabs dashboard.",
+              "isRequired": true,
+              "isSecret": true
+            }
+          }
         }
       ]
     }

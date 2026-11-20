@@ -39,3 +39,19 @@ jobs:
           uv pip install --system --resolution lowest-direct -r pyproject.toml --extra dev
       - name: Test
         run: pytest -q
+
+  # The registry's own checks, so a bad server.json fails here and not after the PyPI release.
+  server_json:
+    runs-on: ubuntu-latest
+    env:
+      MCP_PUBLISHER_VERSION: "1.8.9"
+      MCP_PUBLISHER_SHA256: "4d527ca8f1ced0394c962dc925c2a4a4addef441cbefd62501c875e9481823a8"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install mcp-publisher
+        run: |
+          curl -sSLo mcp-publisher.tar.gz "https://github.com/modelcontextprotocol/registry/releases/download/v${MCP_PUBLISHER_VERSION}/mcp-publisher_linux_amd64.tar.gz"
+          echo "${MCP_PUBLISHER_SHA256}  mcp-publisher.tar.gz" | sha256sum -c -
+          tar xzf mcp-publisher.tar.gz mcp-publisher
+      - name: Validate server.json
+        run: ./mcp-publisher validate
