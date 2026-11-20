@@ -1,7 +1,8 @@
 [project]
 name = "oxylabs-web-api-mcp"
-version = "0.3.0"
+version = "0.3.1"
 description = "Self-hostable MCP server for the Oxylabs Web API (/v1/search, /v1/search/companies, /v1/scrape)"
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     # Imported directly, and no longer brought in by FastMCP 4, which moved to httpx2.

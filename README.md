@@ -103,7 +103,7 @@ cd web-api-mcp
 pip install -e .
 ```
 
-`server.json` is the [MCP registry](https://github.com/modelcontextprotocol/registry) manifest for the PyPI package `oxylabs-web-api-mcp`. The publish workflow refuses a release whose `server.json` versions differ from `pyproject.toml`, so bump them together.
+`server.json` is the [MCP registry](https://github.com/modelcontextprotocol/registry) manifest: it lists the PyPI package `oxylabs-web-api-mcp` and the Remote MCP server. A version tag publishes the package to PyPI and then `server.json` to the registry as `io.oxylabs/web-api-mcp`. The publish workflow refuses a release whose `server.json` versions differ from `pyproject.toml`, so bump them together. Keep the `mcp-name:` line at the top of this README: the registry looks for it in the package description on PyPI.
 
 ### Run it locally (stdio)
 

@@ -1,8 +1,9 @@
-name: Publish to PyPI
+name: Publish to PyPI and the MCP registry
 
 # Runs on a version tag (v0.1.0). Uses PyPI trusted publishing (OIDC) — no token
 # secret; PyPI must have this repo + workflow configured as a trusted publisher
-# for the oxylabs-web-api-mcp project, environment "pypi".
+# for the oxylabs-web-api-mcp project, environment "pypi". Then publishes server.json
+# to the MCP registry with the secret MCP_REGISTRY_PRIVATE_KEY of environment "mcp-registry".
 
 on:
   push:
@@ -49,3 +50,38 @@ jobs:
           python-version: "3.12"
       - run: pip install build && python -m build
       - uses: pypa/gh-action-pypi-publish@release/v1
+
+  # Publishes server.json to the official MCP registry as io.oxylabs/web-api-mcp. The registry
+  # checks the oxylabs.io DNS TXT record against the signing key in MCP_REGISTRY_PRIVATE_KEY,
+  # and the PyPI package's description for the "mcp-name:" line from README.md.
+  publish-registry:
+    needs: publish
+    runs-on: ubuntu-latest
+    environment: mcp-registry
+    env:
+      MCP_PUBLISHER_VERSION: "1.8.9"
+      MCP_PUBLISHER_SHA256: "4d527ca8f1ced0394c962dc925c2a4a4addef441cbefd62501c875e9481823a8"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Wait for PyPI to serve the new version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          for i in $(seq 1 30); do
+            curl -sf "https://pypi.org/pypi/oxylabs-web-api-mcp/$version/json" > /dev/null && exit 0
+            sleep 10
+          done
+          echo "PyPI never served $version" >&2
+          exit 1
+      - name: Install mcp-publisher
+        run: |
+          curl -sSLo mcp-publisher.tar.gz "https://github.com/modelcontextprotocol/registry/releases/download/v${MCP_PUBLISHER_VERSION}/mcp-publisher_linux_amd64.tar.gz"
+          echo "${MCP_PUBLISHER_SHA256}  mcp-publisher.tar.gz" | sha256sum -c -
+          tar xzf mcp-publisher.tar.gz mcp-publisher
+          sudo mv mcp-publisher /usr/local/bin/
+      - name: Publish to the MCP registry
+        env:
+          MCP_REGISTRY_PRIVATE_KEY: ${{ secrets.MCP_REGISTRY_PRIVATE_KEY }}
+        run: |
+          mcp-publisher validate
+          mcp-publisher login dns --domain oxylabs.io --private-key "$MCP_REGISTRY_PRIVATE_KEY"
+          mcp-publisher publish
