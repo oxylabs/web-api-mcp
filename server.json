@@ -7,12 +7,19 @@
     "source": "github"
   },
   "websiteUrl": "https://oxylabs.io",
-  "version": "0.3.1",
+  "icons": [
+    {
+      "src": "https://oxylabs.io/favicon.svg",
+      "mimeType": "image/svg+xml",
+      "sizes": ["any"]
+    }
+  ],
+  "version": "0.3.2",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "oxylabs-web-api-mcp",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "transport": { "type": "stdio" },
       "environmentVariables": [
         {

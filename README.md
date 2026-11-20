@@ -1,6 +1,6 @@
 # Oxylabs Web API — MCP Server
 
-mcp-name: io.oxylabs/web-api-mcp
+<!-- mcp-name: io.oxylabs/web-api-mcp -->
 
 This repository is a developer-focused, technical reference covering the official [Model Context Protocol](https://modelcontextprotocol.io) server for the Oxylabs Web API. It gives any MCP-capable agent live web access – search, scrape pages as Markdown or JSON, and call dedicated scrapers – through one MCP connection.
 
@@ -103,7 +103,7 @@ cd web-api-mcp
 pip install -e .
 ```
 
-`server.json` is the [MCP registry](https://github.com/modelcontextprotocol/registry) manifest: it lists the PyPI package `oxylabs-web-api-mcp` and the Remote MCP server. A version tag publishes the package to PyPI and then `server.json` to the registry as `io.oxylabs/web-api-mcp`. The publish workflow refuses a release whose `server.json` versions differ from `pyproject.toml`, so bump them together. Keep the `mcp-name:` line at the top of this README: the registry looks for it in the package description on PyPI.
+`server.json` is the [MCP registry](https://github.com/modelcontextprotocol/registry) manifest: it lists the PyPI package `oxylabs-web-api-mcp` and the Remote MCP server. A version tag publishes the package to PyPI and then `server.json` to the registry as `io.oxylabs/web-api-mcp`. The publish workflow refuses a release whose `server.json` versions differ from `pyproject.toml`, so bump them together. Keep the `mcp-name:` comment at the top of this README: the registry looks for it in the package description on PyPI, and the HTML comment keeps it off the rendered page.
 
 ### Run it locally (stdio)
 
