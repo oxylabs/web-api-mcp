@@ -54,13 +54,31 @@ claude mcp add --transport http --scope user oxylabs-web-api \
   --header "Authorization: Bearer ${OXYLABS_WEB_API_KEY}"
 ```
 
-Codex:
+Codex — the CLI, the IDE extension and the desktop app share one configuration, so set it up once. The plugin from [web-api-skills](https://github.com/oxylabs/web-api-skills) installs this server together with the Oxylabs skills:
+
+```bash
+codex plugin marketplace add oxylabs/web-api-skills
+codex plugin add oxylabs-web-api@oxylabs-web-api
+```
+
+Or add the server alone:
 
 ```bash
 codex mcp add oxylabs-web-api \
   --url https://mcp.oxylabs.io/web-api-mcp \
   --bearer-token-env-var OXYLABS_WEB_API_KEY
 ```
+
+The desktop app defers MCP tools until the model asks for them, and some models never do. If you added the server alone, list its tools up front by adding `omit_tools_from` to its entry in `~/.codex/config.toml` (the plugin already sets it):
+
+```toml
+[mcp_servers.oxylabs-web-api]
+url = "https://mcp.oxylabs.io/web-api-mcp"
+bearer_token_env_var = "OXYLABS_WEB_API_KEY"
+omit_tools_from = ["deferred"]
+```
+
+Codex reads `OXYLABS_WEB_API_KEY` when it starts and sends it as the bearer token. If the variable isn't set, Codex leaves the server out without an error, and the Oxylabs tools are simply missing. On macOS, the desktop app opened from the Dock or Spotlight doesn't see variables exported in your shell profile. Make the key visible to apps with `launchctl setenv OXYLABS_WEB_API_KEY "your_api_key_here"`, then quit Codex fully (⌘Q) and reopen it. The setting lasts until you log out.
 
 Cursor — one click, then make the key visible to Cursor (below):
 
