@@ -1,5 +1,5 @@
 # Oxylabs Web API — MCP Server
-[![Web API](https://github.com/oxylabs/web-api-mcp/blob/main/Github%20repositories%20banner%20v1%401x%20(1).png)](https://oxylabs.io/products/web-api?utm_source=github&utm_medium=referral&utm_content=web_api_waitinglist&groupid=877)
+[![Web API](https://github.com/oxylabs/web-api-mcp/blob/main/Github%20repositories%20banner%20v1%401x%20(1).png)](https://oxylabs.io/products/web-api?utm_source=github&utm_medium=referral&utm_content=web-api-mcp&groupid=877)
 
 <p align="left">
   <a href="https://dashboard.oxylabs.io"><img src="https://img.shields.io/badge/%F0%9F%9A%80_Get_Started-FF6B35?style=for-the-badge" alt="Get started"></a>
@@ -320,7 +320,7 @@ The tests are offline: error parsing, input validation, envelope trimming, endpo
 For detailed configuration, advanced usage, and code examples in multiple languages, check the official documentation:
 
 - [Oxylabs MCP documentation](https://developers.oxylabs.io/ai-workflows/mcp?utm_source=github&utm_medium=referral&utm_content=web-api-mcp)
-- [Get started with Web API](https://oxylabs.io/products/web-api?utm_source=github&utm_medium=referral&utm_content=web-api-mcp)
+- [Get started with Web API](https://oxylabs.io/products/web-api?utm_source=github&utm_medium=referral&utm_content=web-api-mcp&groupid=877)
 - [Web API documentation](https://developers.oxylabs.io/products/web-api?utm_source=github&utm_medium=referral&utm_content=web-api-mcp)
 
 ## License
