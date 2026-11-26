@@ -110,6 +110,16 @@ Cursor (manual, `~/.cursor/mcp.json`) and other clients supporting custom header
 }
 ```
 
+Dify (Dify Cloud or self-hosted, 1.9.0 and later) — add the server once per workspace in **Integrations → Tools → MCP → Add MCP Server (HTTP)**:
+
+- **Server URL:** `https://mcp.oxylabs.io/web-api-mcp`
+- **Name & Icon:** for example `Oxylabs Web API`
+- **Server Identifier:** for example `oxylabs-web-api`. Apps refer to the server by this identifier, so don't change it later.
+- **Headers:** add a header named `Authorization` with the value `Bearer your_api_key_here`. Dify stores the value encrypted and shows it masked afterwards.
+- **Authentication:** leave as is. The header is enough, and no OAuth sign-in follows.
+
+Click **Add & Authorize**. The tools appear under the server, and you can use them in Agent apps (add them under **Tools**) and in Workflow and Chatflow apps (as Tool nodes, or inside an Agent node). The default timeouts (30 s to connect, 300 s to read) are long enough for pages that need rendering. A wrong or missing key doesn't stop Dify from listing the tools: each call returns a text output saying the key is missing or that authentication failed, while the tool still shows as succeeded, so check the tool's output when results are empty.
+
 Clients that only support OAuth sign-in for remote servers, such as custom connectors in the claude.ai web interface, can't send custom headers and can't connect to the Remote MCP server — use the self-hosted server with those clients instead.
 
 ## Self-hosting
