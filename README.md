@@ -110,7 +110,7 @@ Cursor (manual, `~/.cursor/mcp.json`) and other clients supporting custom header
 }
 ```
 
-Dify (Dify Cloud or self-hosted, 1.9.0 and later) — add the server once per workspace in **Integrations → Tools → MCP → Add MCP Server (HTTP)**:
+Dify — the quickest way is the [Oxylabs Web API plugin](https://marketplace.dify.ai/plugin/oxylabs/oxylabs_web_api) from the Dify Marketplace: install it, paste your Web API key, and its Web Search and Scrape Page tools are ready for agents and workflows. To use this server's full tool set instead (Dify Cloud or self-hosted, 1.9.0 and later), add it once per workspace in **Integrations → Tools → MCP → Add MCP Server (HTTP)**:
 
 - **Server URL:** `https://mcp.oxylabs.io/web-api-mcp`
 - **Name & Icon:** for example `Oxylabs Web API`
